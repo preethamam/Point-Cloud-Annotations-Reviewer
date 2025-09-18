@@ -1,0 +1,8 @@
+PyQt5
+vispy
+open3d
+numpy
+pandas
+openpyxl
+pillow
+tqdm
