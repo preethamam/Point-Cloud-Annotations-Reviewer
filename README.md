@@ -11,6 +11,7 @@ Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load yo
 - Fast rendering on millions of points using VisPy (OpenGL) with compact UI
 - Side‑by‑side view with synchronized camera (rotate/pan/zoom mirrored)
 - Overlay mode: render red annotation points on top of the original cloud
+- Transparency: controls the transparency of the annotations
 - As‑is mode: show the annotation cloud, with red points drawn above others
 - Per‑scene comments stored locally; export to Excel
 - Progress indicator and “Revise” workflow (move files to revision folders)
@@ -199,6 +200,7 @@ Settings highlights:
 - Zoom: anchored at cursor with orthographic scale adjustment (fov=0) or distance change (perspective fallback).
 - Automatic decimation: point clouds are randomly subsampled to `MAX_PTS = 2_000_000` for interactivity.
 - Marker scale: controlled by the Point Size slider.
+- Transparency: controlled by the Transparency slider
 
 Tunable constants (edit in `app.py`):
 

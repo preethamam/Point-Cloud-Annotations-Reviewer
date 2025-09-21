@@ -292,16 +292,20 @@ class DualCanvasVispy(QtWidgets.QWidget):
         self.h_left = self.h_right_base = self.h_right_overlay = None
         self._xyzL = self._xyzRB = self._xyzRO = None      # cached positions for size updates
         self._rgbL = self._rgbRB = self._rgbRO = None
+        
+        self._pt_size = 1.0                      # <-- track current marker size
+        self.overlay_alpha = 1.0                 # <-- NEW: overlay transparency (0..1)
 
 
     @staticmethod
-    def _markers(xyz: np.ndarray, rgb: np.ndarray, size: float, *, depth_test=True) -> visuals.Markers:
+    def _markers(xyz: np.ndarray, rgb: np.ndarray, size: float, *, depth_test=True, alpha: float = 1.0) -> visuals.Markers:
         m = visuals.Markers()
         if xyz is None or len(xyz) == 0:
             return m
         if rgb is None or len(rgb) == 0:
             rgb = np.ones((len(xyz), 3), dtype=np.float32)
-        rgba = np.c_[np.clip(rgb,0,1), np.ones((len(rgb),1))]
+        a = float(np.clip(alpha, 0.0, 1.0))
+        rgba = np.c_[np.clip(rgb,0,1), np.full((len(rgb),1), a, dtype=np.float32)]
         m.set_data(pos=xyz.astype(np.float32),
                 face_color=rgba.astype(np.float32),
                 edge_width=0, size=float(size))
@@ -338,12 +342,14 @@ class DualCanvasVispy(QtWidgets.QWidget):
 
     def set_left(self, xyz: np.ndarray, rgb: np.ndarray, size: float):
         self._xyzL, self._rgbL = xyz, rgb
+        self._pt_size = float(size)
         if xyz is None or len(xyz) == 0:
             self.h_left = None; return
         self.h_left = self._markers(xyz, rgb, size); self.vl.add(self.h_left)
 
     def set_right_base(self, xyz: np.ndarray, rgb: np.ndarray, size: float):
         self._xyzRB, self._rgbRB = xyz, rgb
+        self._pt_size = float(size)
         if xyz is None or len(xyz) == 0:
             self.h_right_base = None; return
         self.h_right_base = self._markers(xyz, rgb, size, depth_test=True)   # unchanged depth
@@ -353,7 +359,7 @@ class DualCanvasVispy(QtWidgets.QWidget):
         self._xyzRO, self._rgbRO = xyz, rgb
         if xyz is None or len(xyz) == 0:
             self.h_right_overlay = None; return
-        self.h_right_overlay = self._markers(xyz, rgb, size, depth_test=False)  # <-- on top
+        self.h_right_overlay = self._markers(xyz, rgb, size, depth_test=False, alpha=self.overlay_alpha)
         self.vr.add(self.h_right_overlay)
 
     def set_point_size(self, size: float):
@@ -368,6 +374,19 @@ class DualCanvasVispy(QtWidgets.QWidget):
         apply(self.h_right_base,   self._xyzRB, self._rgbRB)
         apply(self.h_right_overlay,self._xyzRO, self._rgbRO)
     
+    def set_overlay_alpha(self, alpha: float):
+        """Set transparency (0..1) for the RED overlay layer only."""
+        self.overlay_alpha = float(np.clip(alpha, 0.0, 1.0))
+        if self.h_right_overlay is None or self._xyzRO is None or self._rgbRO is None:
+            return
+        rgba = np.c_[np.clip(self._rgbRO, 0, 1), np.full((len(self._rgbRO), 1), self.overlay_alpha, dtype=np.float32)].astype(np.float32)
+        self.h_right_overlay.set_data(
+            pos=self._xyzRO.astype(np.float32),
+            face_color=rgba,
+            edge_width=0,
+            size=float(self._pt_size)
+        )
+
     def _fit_bounds_top(self, xyz):
         if xyz is None or len(xyz) == 0: return
         mn = xyz.min(axis=0); mx = xyz.max(axis=0)
@@ -601,10 +620,20 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.sld_ps.setFixedWidth(SLIDER_WIDTH_PX)
         self.lbl_ps_val = QtWidgets.QLabel(f"{self.point_size:.1f}")
         self.lbl_ps.setContentsMargins(0,0,6,0)
+        
+        # --- NEW: Transparency slider (affects red overlay only) ---
+        self.lbl_alpha = QtWidgets.QLabel("Transparency:")
+        self.sld_alpha = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.sld_alpha.setRange(0, 100)                 # 0%..100%
+        self.sld_alpha.setSingleStep(1)
+        self.sld_alpha.setValue(100)                    # default fully opaque
+        self.sld_alpha.setFixedWidth(SLIDER_WIDTH_PX)
+        self.lbl_alpha_val = QtWidgets.QLabel("100%")
+        self.lbl_alpha.setContentsMargins(12,0,6,0)     # a tiny gap from point size
 
         # comment rows — span ALL 13 columns
-        grid.addWidget(self.lbl_comment, 0, 0, 1, 13)
-        grid.addWidget(self.txt_comment, 1, 0, 1, 13)
+        grid.addWidget(self.lbl_comment, 0, 0, 1, 16)
+        grid.addWidget(self.txt_comment, 1, 0, 1, 16)
 
         # buttons row
         grid.addWidget(self.btn_prev,  2, 0, 1, 2)
@@ -621,6 +650,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
         grid.addWidget(self.lbl_ps,     2, 10, 1, 1, alignment=QtCore.Qt.AlignRight)
         grid.addWidget(self.sld_ps,     2, 11, 1, 1, alignment=QtCore.Qt.AlignRight)
         grid.addWidget(self.lbl_ps_val, 2, 12, 1, 1, alignment=QtCore.Qt.AlignLeft)
+        grid.addWidget(self.lbl_alpha,     2, 13, 1, 1, alignment=QtCore.Qt.AlignRight)
+        grid.addWidget(self.sld_alpha,     2, 14, 1, 1, alignment=QtCore.Qt.AlignRight)
+        grid.addWidget(self.lbl_alpha_val, 2, 15, 1, 1, alignment=QtCore.Qt.AlignLeft)
 
         self.status=self.statusBar()
         self.pbar = _make_pbar( max(self.total, 1), initial=1, desc="Scenes", leave=False, ncols=65, 
@@ -639,6 +671,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.chk_show_ann.toggled.connect(self.toggle_annotations) 
         self.chk_resume.toggled.connect(self._on_resume_toggle)
         self.sld_ps.valueChanged.connect(self.on_slider)
+        self.sld_alpha.valueChanged.connect(self.on_alpha_slider)
 
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self.save_png)        
 
@@ -766,6 +799,12 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.point_size = max(0.1, val/10.0)
         self.lbl_ps_val.setText(f"{self.point_size:.1f}")
         self.canvas.set_point_size(self.point_size*MARKER_SCALE_VISPY)
+        
+    def on_alpha_slider(self, val: int):
+        alpha = max(0.0, min(1.0, val / 100.0))
+        self.lbl_alpha_val.setText(f"{int(alpha*100)}%")
+        self.canvas.set_overlay_alpha(alpha)
+
 
     def _remember_position(self):
         if self.total and self.settings.get("continue_where_left", False):
