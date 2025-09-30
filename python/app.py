@@ -525,6 +525,15 @@ class ReviewerApp(QtWidgets.QMainWindow):
     def __init__(self, settings: dict):
         super().__init__()
         self.settings = settings
+        
+        # Track revised files across the session (and persist them)
+        self.settings.setdefault("REVISED_FILES", [])
+        self.settings.setdefault("REVISED_ORIGS", {})   # map revised anno path -> absolute original path
+
+        # Clean out any non-existent paths
+        self.settings["REVISED_FILES"] = [p for p in self.settings["REVISED_FILES"] if os.path.exists(p)]
+        save_settings(self.settings)
+
         self.ORIG_DIRS   = settings.get("ORIG_DIRS", [])
         self.ANNO_DIRS   = settings.get("ANNO_DIRS", [])
         self.REVISE_DIRS = settings.get("REVISE_DIRS", [])
@@ -532,8 +541,32 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.last_export = settings.get("last_export_path", str(Path.home()))
 
         self.comments: Dict[str,str] = ensure_comments()
+        self.stems, self.anno_map, self.orig_map = self.collect()    
+        
+        # --- one-time migration from legacy stem-only keys (only when unambiguous) ---
+        def _migrate_legacy_comments():
+            # count how many times each stem_only appears across current list
+            stem_count = {}
+            for k in self.stems:
+                ap = self.anno_map.get(k, "")
+                st = os.path.splitext(os.path.basename(ap or ""))[0]
+                stem_count[st] = stem_count.get(st, 0) + 1
 
-        self.stems, self.anno_map = self.collect()
+            changed = False
+            for k in self.stems:
+                if k in self.comments:
+                    continue
+                ap = self.anno_map.get(k, "")
+                st = os.path.splitext(os.path.basename(ap or ""))[0]
+                # migrate only if this stem appears exactly once (no ambiguity)
+                if stem_count.get(st, 0) == 1 and st in self.comments:
+                    self.comments[k] = self.comments.pop(st)
+                    changed = True
+            if changed:
+                save_comments(self.comments)
+
+        _migrate_legacy_comments()
+      
         self.idx=0; self.total=len(self.stems)
         self._seen: set = set()
         if self.total > 0:
@@ -682,11 +715,48 @@ class ReviewerApp(QtWidgets.QMainWindow):
             
         QtWidgets.QApplication.instance().installEventFilter(self)
 
-    # ----- data
-    def collect(self) -> Tuple[List[str], Dict[str,str]]:
-        files=[p for root in self.ANNO_DIRS for ext in ALLOWED_EXT for p in glob.glob(os.path.join(root, f"*{ext}"))]
-        amap={stem(p): p for p in files}
-        return sorted(amap.keys(), key=natural_k), amap
+    # ----- data collection -----
+    def collect(self) -> Tuple[List[str], Dict[str, str], Dict[str, Optional[str]]]:
+        """
+        Build keys from the relative path under each ANNO_DIR (without extension),
+        e.g., 'Concrete/branched/branched_1'. This avoids filename collisions and
+        lets us pair to the matching Original via same-index roots.
+        """
+        anno_map: Dict[str, str] = {}
+        orig_map: Dict[str, Optional[str]] = {}
+
+        for i, anno_root in enumerate(self.ANNO_DIRS):
+            for ext in ALLOWED_EXT:
+                pat = os.path.join(anno_root, f"**/*{ext}")
+                for p in glob.glob(pat, recursive=True):
+                    if not os.path.isfile(p):
+                        continue
+                    rel = os.path.relpath(p, anno_root)                 # e.g., Concrete\branched\branched_1.ply
+                    stem_rel = os.path.splitext(rel)[0].replace("\\", "/")
+
+                    # >>> NEW: key is prefixed with the anno-root index to avoid collisions
+                    key = f"{i:02d}/{stem_rel}"
+                    anno_map[key] = p
+
+                    # Pair with Original of the SAME index, preserving the same rel path
+                    ori = None
+                    if i < len(self.ORIG_DIRS):
+                        cand = os.path.join(self.ORIG_DIRS[i], rel)
+                        if os.path.exists(cand):
+                            ori = cand
+                        else:
+                            # fallback: try any allowed extension under same rel stem
+                            stem_rel = os.path.splitext(rel)[0]
+                            for e in ALLOWED_EXT:
+                                q = os.path.join(self.ORIG_DIRS[i], stem_rel + e)
+                                if os.path.exists(q):
+                                    ori = q
+                                    break
+                    orig_map[key] = ori
+
+        stems = sorted(anno_map.keys(), key=natural_k)
+        return stems, anno_map, orig_map
+
 
     def toggle_annotations(self, checked: bool):
         self.show_annotations = bool(checked)
@@ -704,15 +774,19 @@ class ReviewerApp(QtWidgets.QMainWindow):
         if self.total==0: return
         self.canvas.clear()
 
-        name=self.stems[self.idx]
-        orig_p=find_file(name, self.ORIG_DIRS)
-        anno_p=self.anno_map.get(name)
+        name = self.stems[self.idx]                     # key is relative path (no ext)
+        anno_p = self.anno_map.get(name)
+        # derive stem-only for compatibility (used for title & old comments)
+        stem_only = os.path.splitext(os.path.basename(anno_p or ""))[0]
+        orig_p = self.orig_map.get(name) or find_file(stem_only, self.ORIG_DIRS)
 
-        orig=load_pc(orig_p)
-        anno=load_pc(anno_p)
-        
-        file_name =  file_stem(orig_p)
-        key = self.stems[self.idx]     # <-- use stem for comments (matches save_comment)
+        file_name = file_stem(anno_p or orig_p or name)  # for window title/status
+        key = name  # comments key (new, collision-proof)
+        abs_key = os.path.abspath(anno_p) if anno_p else None
+
+        # load point clouds
+        orig = load_pc(orig_p)
+        anno = load_pc(anno_p)
 
         # left: original
         if orig is not None and len(orig.points)>0:
@@ -764,8 +838,15 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
         self.setWindowTitle(f"{APP_NAME} — {file_name}   ({self.idx+1}/{self.total})")
 
+        # self.txt_comment.blockSignals(True)
+        # self.txt_comment.setPlainText(self.comments.get(key, ""))
+        # self.txt_comment.blockSignals(False)
+        
         self.txt_comment.blockSignals(True)
-        self.txt_comment.setPlainText(self.comments.get(key, ""))
+        self.txt_comment.setPlainText(
+            (self.comments.get(abs_key) if abs_key else "") or
+            self.comments.get(key, "")
+        )
         self.txt_comment.blockSignals(False)
 
         # advance progress only the first time this stem is viewed
@@ -825,13 +906,27 @@ class ReviewerApp(QtWidgets.QMainWindow):
         super().closeEvent(event) 
 
     def save_comment(self):
-        if self.total==0: return
-        name=self.stems[self.idx]
-        txt=self.txt_comment.toPlainText().strip()
-        if txt: self.comments[name]=txt
-        else: self.comments.pop(name, None)
+        if self.total == 0:
+            return
+        name = self.stems[self.idx]                     # existing key (index-prefixed relpath)
+        anno_p = self.anno_map.get(name)
+        abs_key = os.path.abspath(anno_p) if anno_p else None
+
+        txt = self.txt_comment.toPlainText().strip()
+        if not txt:
+            # Do NOT delete on empty text (protects comments during revise/autosave)
+            return
+
+        # Primary: absolute annotation path (collision-proof, future-proof)
+        if abs_key:
+            self.comments[abs_key] = txt
+
+        # Secondary: keep writing legacy key for backward compatibility
+        self.comments[name] = txt
+
         save_comments(self.comments)
-        self.status.showMessage(f"Comment saved for {name} → {COMMENTS}", 2000)
+        self.status.showMessage(f"Comment saved for {abs_key or name} → {COMMENTS}", 2000)
+
 
     def move_to_revise(self):
         if self.total==0: return
@@ -850,6 +945,38 @@ class ReviewerApp(QtWidgets.QMainWindow):
         try: shutil.move(ap, dst)
         except Exception as e:
             self.status.showMessage(f"Move failed: {e}", 6000); return
+            
+        # ===================== INSERT THIS BLOCK HERE =====================
+        # <<< NEW: migrate comment abs-path key, and remember revised file >>>
+        ap_abs  = os.path.abspath(ap)
+        dst_abs = os.path.abspath(dst)
+
+        # migrate absolute-path comment key (if present)
+        migrated = False
+        if ap_abs in self.comments:
+            self.comments[dst_abs] = self.comments.pop(ap_abs)
+            migrated = True
+        if migrated:
+            save_comments(self.comments)
+
+        # remember revised file for Excel export
+        if dst_abs not in self.settings["REVISED_FILES"]:
+            self.settings["REVISED_FILES"].append(dst_abs)
+
+        # pair ORIGINAL path using same src-root + relpath
+        try:
+            src_root = os.path.abspath(self.ANNO_DIRS[src_idx])
+            rel = os.path.relpath(ap_abs, src_root)  # rel inside the ANNO root
+            if src_idx < len(self.ORIG_DIRS):
+                cand_orig = os.path.join(self.ORIG_DIRS[src_idx], rel)
+                if os.path.exists(cand_orig):
+                    self.settings["REVISED_ORIGS"][dst_abs] = os.path.abspath(cand_orig)
+        except Exception:
+            pass
+
+        save_settings(self.settings)
+        # =================== END OF INSERTED BLOCK ========================
+    
         del self.anno_map[name]
         self.stems.pop(self.idx)
         self.total=len(self.stems)
@@ -875,19 +1002,25 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
     # ----- Excel export
     def _ann_stats(self, st: str) -> Tuple[int, str]:
-        p=self.anno_map.get(st)
-        if not p or not os.path.exists(p): return 0,"none"
+        p = self.anno_map.get(st)
+        if not p or not os.path.exists(p):
+            return 0, "none"
         try:
-            pc=load_pc(p)
-            if pc is None or len(pc.points)==0: return 0,"none"
-            _, c=pc_to_xyz_rgb(pc)
-            if self.overlay_mode:
-                cnt=int(np.count_nonzero(red_mask(c)))
-                return cnt, ("crack" if cnt>0 else "none")
-            else:
-                return 0,"none"
+            pc = load_pc(p)
+            if pc is None or len(pc.points) == 0:
+                return 0, "none"
+            _, c = pc_to_xyz_rgb(pc)
+            if c.size == 0:
+                return 0, "none"
+
+            # Be robust if some files carry 0–255 colors
+            if np.nanmax(c) > 1.0:
+                c = np.clip(c / 255.0, 0.0, 1.0)
+
+            cnt = int(np.count_nonzero(red_mask(c)))
+            return cnt, ("crack" if cnt > 0 else "none")
         except Exception:
-            return 0,"none"
+            return 0, "none"
 
     def export_excel(self):
         self.save_comment()
@@ -897,15 +1030,71 @@ class ReviewerApp(QtWidgets.QMainWindow):
         )
         if not path: return
         if not path.lower().endswith(".xlsx"): path += ".xlsx"
-        rows=[]
-        all_stems=set(self.stems) | set(self.comments.keys())
-        for st in sorted(all_stems, key=natural_k):
-            cmt=self.comments.get(st,"")
-            has=bool(cmt.strip())
-            cnt,cls=self._ann_stats(st)
-            rows.append({"filename":st,"comment":cmt,"has_comment":has,
-                         "annotations_count":cnt,"annotations_class":cls})
-        df=pd.DataFrame(rows)
+        rows = []
+
+        # Helper: count red points given an absolute annotation file path
+        def _stats_from_path(anno_path: str) -> Tuple[int, str]:
+            if not anno_path or not os.path.exists(anno_path):
+                return 0, "none"
+            try:
+                pc = load_pc(anno_path)
+                if pc is None or len(pc.points) == 0:
+                    return 0, "none"
+                _, c = pc_to_xyz_rgb(pc)
+                if c.size == 0:
+                    return 0, "none"
+                if np.nanmax(c) > 1.0:
+                    c = np.clip(c / 255.0, 0.0, 1.0)
+                cnt = int(np.count_nonzero(red_mask(c)))
+                return cnt, ("crack" if cnt > 0 else "none")
+            except Exception:
+                return 0, "none"
+
+        # 3a) Export currently listed items (self.stems)
+        for st in sorted(self.stems, key=natural_k):
+            anno_p   = self.anno_map.get(st, "") or ""
+            orig_p   = self.orig_map.get(st, "") or ""
+            anno_abs = os.path.abspath(anno_p) if anno_p else ""
+            orig_abs = os.path.abspath(orig_p) if orig_p else ""
+
+            # comment: absolute-path key first, then legacy key
+            cmt = (self.comments.get(anno_abs) or self.comments.get(st, "") or "").strip()
+            has = bool(cmt)
+
+            cnt, cls = self._ann_stats(st)   # uses anno_map; fine for in-list items
+
+            rows.append({
+                "filename":          anno_abs,   # ALWAYS absolute
+                "annotation_path":   anno_abs,
+                "original_path":     orig_abs,
+                "comment":           cmt,
+                "has_comment":       has,
+                "annotations_count": cnt,
+                "annotations_class": cls,
+            })
+
+        # 3b) Append revised items (moved out of ANNO_DIRS)
+        revised_files = [p for p in self.settings.get("REVISED_FILES", []) if os.path.exists(p)]
+        revised_origs = self.settings.get("REVISED_ORIGS", {})
+
+        for anno_abs in revised_files:
+            orig_abs = revised_origs.get(anno_abs, "")
+            cmt = (self.comments.get(anno_abs) or "").strip()
+            has = bool(cmt)
+            cnt, cls = _stats_from_path(anno_abs)
+
+            rows.append({
+                "filename":          anno_abs,   # ALWAYS absolute
+                "annotation_path":   anno_abs,
+                "original_path":     orig_abs,
+                "comment":           cmt,
+                "has_comment":       has,
+                "annotations_count": cnt,
+                "annotations_class": cls,
+            })
+
+        df = pd.DataFrame(rows)
+
         try:
             with pd.ExcelWriter(path, engine="openpyxl") as xw:
                 df.to_excel(xw, index=False, sheet_name="Comments")
@@ -925,13 +1114,12 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 vals=dlg.values()
                 self.ORIG_DIRS=vals["ORIG_DIRS"]; self.ANNO_DIRS=vals["ANNO_DIRS"]; self.REVISE_DIRS=vals["REVISE_DIRS"]
                 self.settings.update(vals); save_settings(self.settings)
-                stems, amap = self.collect()
-                if not stems:
+                self.stems, self.anno_map, self.orig_map = self.collect()
+                if not self.stems:
                     QtWidgets.QMessageBox.warning(self, "No files",
                         "No annotation *.ply / *.pcd found in the selected folders. Please select again.")
                     dlg = FolderPrefsDialog(self.settings, self)
                     continue
-                self.stems, self.anno_map = stems, amap
                 self.idx=0; self.total=len(self.stems)
                 
                 self._seen.clear()
