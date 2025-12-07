@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Point Cloud Reviewer — PyQt5 + VisPy (fast 3-D, synced dual view)
+# Point Cloud Reviewer — PyQt5 + PyVista (fast 3-D, synced dual view)
 # Features: folders dialog (persisted), per-scene comments (LocalAppData), Excel export,
 # overlay toggle (red-on-blue vs as-is), compact right-justified slider, 1/N counter,
 # shared 3-D camera (rotate/pan/zoom) for left & right canvases, Save PNG (composite).
@@ -15,9 +15,20 @@ from tqdm import tqdm
 import pandas as pd            # pip install pandas openpyxl
 from PIL import Image          # pip install pillow
 
-# ==== NEW: fast GPU renderer (VisPy) ==========================================
-from vispy import scene
-from vispy.scene import visuals
+# ==== NEW: fast GPU renderer (pyvista) ==========================================
+import pyvista as pv
+from pyvistaqt import QtInteractor
+import vtk
+import logging
+
+# Silence VTK global warning/error spam (wglMakeCurrent etc.)
+vtk.vtkObject.GlobalWarningDisplayOff()
+
+# Make root logger less chatty: ignore ERROR-level messages from VTK bridge
+root_logger = logging.getLogger()
+if root_logger.level < logging.CRITICAL:
+    root_logger.setLevel(logging.CRITICAL)
+
 # ==============================================================================
 
 # ======= TUNABLES ==============================================================
@@ -27,8 +38,7 @@ ALLOWED_EXT            = (".ply", ".pcd")
 MAX_PTS                = 2_000_000     # interactive decimation cap
 COMMENT_BOX_HEIGHT     = 40            # tweak comment box height here
 SLIDER_WIDTH_PX        = 180           # compact slider width (pixels)
-MARKER_SCALE_VISPY     = 1.0           # VisPy size = slider_value * this factor
-ZOOM_BASE              = 1.25          # 1.25–1.6 is a good range; increase for faster per-tick zoom
+MARKER_SCALE           = 1.0           # Marker size = slider_value * this factor
 # ==============================================================================
 
 LOCALAPP = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData/Local")
@@ -221,304 +231,477 @@ class FolderPrefsDialog(QtWidgets.QDialog):
         def collect(lw): return [lw.item(i).text() for i in range(lw.count())]
         return {"ORIG_DIRS": collect(self.orig), "ANNO_DIRS": collect(self.anno), "REVISE_DIRS": collect(self.revi)}
 
-# ---------------- VisPy dual canvas (shared camera) -----------------
-class DualCanvasVispy(QtWidgets.QWidget):
+# ---------------- PyVista dual canvas (shared camera) -----------------
+class DualCanvasPyVista(QtWidgets.QWidget):
     """
-    Two side-by-side VisPy canvases with a SHARED TurntableCamera.
+    Two side-by-side PyVista/VTK canvases with a SHARED camera.
     Left = Original, Right = Annotation (overlay/as-is).
     """
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.left  = scene.SceneCanvas(keys=None, size=(600, 600), bgcolor='white', show=False)
-        self.right = scene.SceneCanvas(keys=None, size=(600, 600), bgcolor='white', show=False)
 
+        # --- layout with titles, same as before ---
         lay = QtWidgets.QHBoxLayout(self)
-        lay.setContentsMargins(0,0,0,0)
+        lay.setContentsMargins(0, 0, 0, 0)
 
-        # left panel with title
+        # Left panel
         left_container = QtWidgets.QWidget()
         left_v = QtWidgets.QVBoxLayout(left_container)
-        left_v.setContentsMargins(0,0,0,0)
+        left_v.setContentsMargins(0, 0, 0, 0)
         self.titleL = QtWidgets.QLabel("Original")
         self.titleL.setAlignment(QtCore.Qt.AlignHCenter)
         self.titleL.setStyleSheet("font-weight:600;")
         left_v.addWidget(self.titleL)
-        left_v.addWidget(self.left.native, 1)
 
-        # right panel with title
+        self.plotterL = QtInteractor(left_container)
+        left_v.addWidget(self.plotterL, 1)
+
+        # Right panel
         right_container = QtWidgets.QWidget()
         right_v = QtWidgets.QVBoxLayout(right_container)
-        right_v.setContentsMargins(0,0,0,0)
+        right_v.setContentsMargins(0, 0, 0, 0)
         self.titleR = QtWidgets.QLabel("Annotation")
         self.titleR.setAlignment(QtCore.Qt.AlignHCenter)
         self.titleR.setStyleSheet("font-weight:600;")
         right_v.addWidget(self.titleR)
-        right_v.addWidget(self.right.native, 1)
+
+        self.plotterR = QtInteractor(right_container)
+        right_v.addWidget(self.plotterR, 1)
 
         lay.addWidget(left_container, 1)
         lay.addWidget(right_container, 1)
 
-        # views
-        self.vl = self.left.central_widget.add_view()
-        self.vr = self.right.central_widget.add_view()
-
-        # --- two cameras (no shared camera to avoid transform drift) ---
-        self.camL = scene.cameras.TurntableCamera(fov=0.0, azimuth=0.0, elevation=90.0, up='+z', distance=1.0)
-        self.camR = scene.cameras.TurntableCamera(fov=0.0, azimuth=0.0, elevation=90.0, up='+z', distance=1.0)
-        self.vl.camera = self.camL
-        self.vr.camera = self.camR
-
-        # start both with the same state
-        self.camR.set_state(self.camL.get_state())
-
-        # --- take over the wheel on each view (prevent double-zoom) ---
-        for v in (self.vl, self.vr):
+        # Basic visual style
+        for pl in (self.plotterL, self.plotterR):
+            pl.set_background("white")
+            # Hide bounds axes if any (no positional args!)
             try:
-                v.events.mouse_wheel.disconnect(v.camera.on_mouse_wheel)  # stop default zoom
+                pl.remove_bounds_axes()
             except Exception:
                 pass
-            # bind our handler; capture the view in the lambda
-            v.events.mouse_wheel.connect(lambda ev, vv=v: self._on_wheel(ev, vv))
+            pl.enable_parallel_projection()  # orthographic, closer to your top view
 
-        # --- keep cameras mirrored during pan/rotate/drag (no camera event names needed) ---
-        # mirror from whichever view is being interacted with
-        self.left.events.mouse_move.connect(   lambda ev, vv=self.vl: self._mirror_from_view(vv))
-        self.right.events.mouse_move.connect(  lambda ev, vv=self.vr: self._mirror_from_view(vv))
-        self.left.events.mouse_release.connect(lambda ev, vv=self.vl: self._mirror_from_view(vv))
-        self.right.events.mouse_release.connect(lambda ev, vv=self.vr: self._mirror_from_view(vv))
+
+        # Share the same VTK camera between both plotters so
+        # pan/zoom/rotate in one updates the other.
+        shared_cam = self.plotterL.camera
+        self.plotterR.camera = shared_cam
+        
+        # --- NEW: zoom-at-cursor state + event filtering for mouse wheel ---
+        self._in_zoom = False
+        for pl in (self.plotterL, self.plotterR):
+            pl.interactor.setMouseTracking(True)
+            pl.interactor.installEventFilter(self)
 
         # handles + cached data
-        self.h_left = self.h_right_base = self.h_right_overlay = None
-        self._xyzL = self._xyzRB = self._xyzRO = None      # cached positions for size updates
+        self.actor_left = None
+        self.actor_right_base = None
+        self.actor_right_overlay = None
+
+        self._xyzL = self._xyzRB = self._xyzRO = None
         self._rgbL = self._rgbRB = self._rgbRO = None
-        
-        self._pt_size = 1.0                      # <-- track current marker size
-        self.overlay_alpha = 1.0                 # <-- NEW: overlay transparency (0..1)
 
+        self._pt_size = 5.0
+        self.overlay_alpha = 1.0
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
     @staticmethod
-    def _markers(xyz: np.ndarray, rgb: np.ndarray, size: float, *, depth_test=True, alpha: float = 1.0) -> visuals.Markers:
-        m = visuals.Markers()
-        if xyz is None or len(xyz) == 0:
-            return m
-        if rgb is None or len(rgb) == 0:
-            rgb = np.ones((len(xyz), 3), dtype=np.float32)
-        a = float(np.clip(alpha, 0.0, 1.0))
-        rgba = np.c_[np.clip(rgb,0,1), np.full((len(rgb),1), a, dtype=np.float32)]
-        m.set_data(pos=xyz.astype(np.float32),
-                face_color=rgba.astype(np.float32),
-                edge_width=0, size=float(size))
-        # draw-state: blend, and (optionally) disable depth test
-        m.set_gl_state('opaque' if depth_test else 'translucent', depth_test=bool(depth_test))
-        m.antialias = 0
-        return m
+    def _make_polydata(xyz: np.ndarray, rgb: np.ndarray) -> pv.PolyData:
+        pts = np.asarray(xyz, dtype=np.float32)
+        pdata = pv.PolyData(pts)
 
-    def _set_range_from_bounds(self, xyz):
+        if rgb is not None and len(rgb) == len(pts):
+            # pyvista wants 0–255 uint8 for rgb=True
+            col = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+            col = (col * 255.0).astype(np.uint8)
+            pdata["RGB"] = col
+        else:
+            # fallback : white
+            pdata["RGB"] = np.full((len(pts), 3), 255, dtype=np.uint8)
+
+        return pdata
+
+    def _add_or_update_actor(self, which: str,
+                             xyz: Optional[np.ndarray],
+                             rgb: Optional[np.ndarray],
+                             size: float,
+                             *, overlay: bool = False):
+        """
+        Internal: create/update actor on left/right plotter.
+        which: 'left', 'right_base', 'right_overlay'
+        """
+        if which == "left":
+            plotter = self.plotterL
+            attr_actor = "actor_left"
+        elif which == "right_base":
+            plotter = self.plotterR
+            attr_actor = "actor_right_base"
+        else:  # "right_overlay"
+            plotter = self.plotterR
+            attr_actor = "actor_right_overlay"
+
+        # Remove actor if no data
         if xyz is None or len(xyz) == 0:
+            actor = getattr(self, attr_actor, None)
+            if actor is not None:
+                try:
+                    plotter.remove_actor(actor, reset_camera=False, render=False)
+                except Exception:
+                    pass
+            setattr(self, attr_actor, None)
             return
-        mn = xyz.min(axis=0); mx = xyz.max(axis=0)
-        self._xyz_bounds = (mn, mx)
-        center = (mn + mx) * 0.5
-        extent = float(np.linalg.norm(mx - mn)) or 1.0
 
-        # set left, then mirror to right via the same state
-        self.camL.center = center
-        self.camL.distance = extent * 1.2
-        # push the same state to the right (without recursion)
-        self._syncing = True
-        self.camR.set_state(self.camL.get_state())
-        self._syncing = False
+        pdata = self._make_polydata(xyz, rgb)
 
+        # Either update existing actor or create a new one
+        actor = getattr(self, attr_actor, None)
+        if actor is None:
+            actor = plotter.add_mesh(
+                pdata,
+                scalars="RGB",
+                rgb=True,
+                point_size=float(size),
+                render_points_as_spheres=True,
+                lighting=False,
+                show_scalar_bar=False,
+            )
+            setattr(self, attr_actor, actor)
+        else:
+            # update underlying mesh + properties
+            actor.mapper.SetInputData(pdata)  # type: ignore[attr-defined]
+            prop = actor.GetProperty()
+            prop.SetPointSize(float(size))
+
+        # Overlay transparency
+        if overlay:
+            prop = actor.GetProperty()
+            prop.SetOpacity(float(self.overlay_alpha))
+        else:
+            prop = actor.GetProperty()
+            prop.SetOpacity(1.0)
+
+        # ensure fresh render (but don't spam)
+        plotter.render()
+
+    # ------------------------------------------------------------------
+    # API used by ReviewerApp
+    # ------------------------------------------------------------------
     def set_titles(self, left: str, right: str):
         self.titleL.setText(left)
         self.titleR.setText(right)
 
     def clear(self):
-        for h in (self.h_left, self.h_right_base, self.h_right_overlay):
-            if h is not None and h.parent is not None:
-                h.parent = None
-        self.h_left = self.h_right_base = self.h_right_overlay = None
+        for pl in (self.plotterL, self.plotterR):
+            try:
+                pl.clear()  # keeps camera, just removes actors
+            except Exception:
+                pass
+        self.actor_left = self.actor_right_base = self.actor_right_overlay = None
 
     def set_left(self, xyz: np.ndarray, rgb: np.ndarray, size: float):
         self._xyzL, self._rgbL = xyz, rgb
         self._pt_size = float(size)
         if xyz is None or len(xyz) == 0:
-            self.h_left = None; return
-        self.h_left = self._markers(xyz, rgb, size); self.vl.add(self.h_left)
+            self._add_or_update_actor("left", None, None, self._pt_size)
+        else:
+            self._add_or_update_actor("left", xyz, rgb, self._pt_size)
 
     def set_right_base(self, xyz: np.ndarray, rgb: np.ndarray, size: float):
         self._xyzRB, self._rgbRB = xyz, rgb
         self._pt_size = float(size)
         if xyz is None or len(xyz) == 0:
-            self.h_right_base = None; return
-        self.h_right_base = self._markers(xyz, rgb, size, depth_test=True)   # unchanged depth
-        self.vr.add(self.h_right_base)
+            self._add_or_update_actor("right_base", None, None, self._pt_size)
+        else:
+            self._add_or_update_actor("right_base", xyz, rgb, self._pt_size)
 
-    def set_right_overlay(self, xyz: Optional[np.ndarray], rgb: Optional[np.ndarray], size: float):
+    def set_right_overlay(self, xyz: Optional[np.ndarray],
+                          rgb: Optional[np.ndarray],
+                          size: float):
         self._xyzRO, self._rgbRO = xyz, rgb
+        self._pt_size = float(size)
         if xyz is None or len(xyz) == 0:
-            self.h_right_overlay = None; return
-        self.h_right_overlay = self._markers(xyz, rgb, size, depth_test=False, alpha=self.overlay_alpha)
-        self.vr.add(self.h_right_overlay)
+            self._add_or_update_actor("right_overlay", None, None, self._pt_size,
+                                      overlay=True)
+        else:
+            # overlay actor, separate opacity
+            self._add_or_update_actor("right_overlay", xyz, rgb, self._pt_size,
+                                      overlay=True)
 
     def set_point_size(self, size: float):
-        def apply(h, xyz, rgb):
-            if h is None or xyz is None or rgb is None: 
-                return
-            rgba = np.c_[np.clip(rgb, 0, 1), np.ones((len(rgb), 1))].astype(np.float32)
-            h.set_data(pos=xyz.astype(np.float32), face_color=rgba, edge_width=0, size=float(size))
-            h.antialias = 0
+        """Update point size for all layers."""
+        self._pt_size = float(size)
 
-        apply(self.h_left,         self._xyzL,  self._rgbL)
-        apply(self.h_right_base,   self._xyzRB, self._rgbRB)
-        apply(self.h_right_overlay,self._xyzRO, self._rgbRO)
-    
+        # Left
+        if self.actor_left is not None:
+            try:
+                self.actor_left.GetProperty().SetPointSize(self._pt_size)
+            except Exception:
+                pass
+
+        # Right base
+        if self.actor_right_base is not None:
+            try:
+                self.actor_right_base.GetProperty().SetPointSize(self._pt_size)
+            except Exception:
+                pass
+
+        # Right overlay
+        if self.actor_right_overlay is not None:
+            try:
+                self.actor_right_overlay.GetProperty().SetPointSize(self._pt_size)
+            except Exception:
+                pass
+
+        # render once
+        self.plotterL.render()
+        self.plotterR.render()
+
     def set_overlay_alpha(self, alpha: float):
         """Set transparency (0..1) for the RED overlay layer only."""
         self.overlay_alpha = float(np.clip(alpha, 0.0, 1.0))
-        if self.h_right_overlay is None or self._xyzRO is None or self._rgbRO is None:
+        if self.actor_right_overlay is not None:
+            try:
+                self.actor_right_overlay.GetProperty().SetOpacity(self.overlay_alpha)
+                self.plotterR.render()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Camera utilities
+    # ------------------------------------------------------------------
+    def _fit_bounds_top_for(self, xyz: np.ndarray, plotter: QtInteractor):
+        """Center the camera above the data and set parallel_scale so it fits."""
+        if xyz is None or len(xyz) == 0:
             return
-        rgba = np.c_[np.clip(self._rgbRO, 0, 1), np.full((len(self._rgbRO), 1), self.overlay_alpha, dtype=np.float32)].astype(np.float32)
-        self.h_right_overlay.set_data(
-            pos=self._xyzRO.astype(np.float32),
-            face_color=rgba,
-            edge_width=0,
-            size=float(self._pt_size)
-        )
 
-    def _fit_bounds_top(self, xyz):
-        if xyz is None or len(xyz) == 0: return
-        mn = xyz.min(axis=0); mx = xyz.max(axis=0)
-        center = (mn + mx) * 0.5
-        extent = float(np.linalg.norm(mx - mn)) or 1.0
+        xyz = np.asarray(xyz, dtype=np.float32)
+        mn = xyz.min(axis=0)
+        mx = xyz.max(axis=0)
+        center = 0.5 * (mn + mx)
+        extent = mx - mn
 
-        # top view + orthographic scale fit
-        self.camL.center = center
-        self.camL.azimuth = 0.0
-        self.camL.elevation = 90.0
-        self.camL.roll = 0.0
-        self.camL.scale_factor = extent * 0.8  # <-- use scale_factor for fov=0 (ortho)
+        cx, cy, cz = center.tolist()
+        dx, dy, dz = extent.tolist()
 
-        self._syncing = True
-        self.camR.set_state(self.camL.get_state())
-        self._syncing = False
+        # Top-down: camera above looking down -Z (Z is up)
+        dist = float(np.linalg.norm(extent)) or 1.0
+        position = (cx, cy, cz + dist)
+        focal    = (cx, cy, cz)
+        viewup   = (0.0, 1.0, 0.0)
+
+        # Set orientation/position
+        plotter.camera_position = (position, focal, viewup)
+
+        # *** IMPORTANT for parallel projection: set parallel_scale so XY fits ***
+        cam = plotter.camera
+        span_xy = max(dx, dy, 1e-6)  # avoid zero
+        # parallel_scale is roughly half the visible height in world units
+        cam.parallel_scale = 0.5 * span_xy * 1.05  # small margin
+
+        plotter.reset_camera_clipping_range()
 
     def fit_to_data_top(self):
-        # choose the biggest available cloud (left preferred, then right base)
-        xyz = self._xyzL
-        if xyz is None or len(xyz) == 0:
-            xyz = self._xyzRB
-        self._fit_bounds_top(xyz)
+        """Fit shared camera to all available data in a top-down view."""
+        xyz_list = []
+        for arr in (self._xyzL, self._xyzRB, self._xyzRO):
+            if arr is not None and len(arr):
+                xyz_list.append(arr)
+
+        if not xyz_list:
+            return
+
+        all_xyz = np.vstack(xyz_list)
+
+        # Set camera on left and copy to right
+        self._fit_bounds_top_for(all_xyz, self.plotterL)
+        self.plotterR.camera_position = self.plotterL.camera_position
+
+        self.plotterL.render()
+        self.plotterR.render()
+
 
     def reset_view(self):
-        self.fit_to_data_top()          
-        
-    # Composite screenshot of both canvases, side-by-side
+        self.fit_to_data_top()
+
+    # ------------------------------------------------------------------
+    # Screenshot
+    # ------------------------------------------------------------------
     def screenshot_rgba(self) -> np.ndarray:
-        imgL = self.left.render()   # RGBA uint8
-        imgR = self.right.render()
+        """
+        Composite screenshot of both canvases, side-by-side (RGBA uint8).
+        """
+        imgL = self.plotterL.screenshot(return_img=True)
+        imgR = self.plotterR.screenshot(return_img=True)
+
+        # ensure RGBA, not RGB
+        if imgL.shape[2] == 3:
+            a = np.full(imgL.shape[:2] + (1,), 255, dtype=np.uint8)
+            imgL = np.concatenate([imgL, a], axis=2)
+        if imgR.shape[2] == 3:
+            a = np.full(imgR.shape[:2] + (1,), 255, dtype=np.uint8)
+            imgR = np.concatenate([imgR, a], axis=2)
+
         h = max(imgL.shape[0], imgR.shape[0])
-        # pad shorter one to match height
+
         def pad_to_h(img):
-            if img.shape[0] == h: return img
+            if img.shape[0] == h:
+                return img
             pad = np.zeros((h - img.shape[0], img.shape[1], 4), dtype=img.dtype)
             return np.vstack([img, pad])
-        return np.hstack([pad_to_h(imgL), pad_to_h(imgR)])    
+
+        imgL = pad_to_h(imgL)
+        imgR = pad_to_h(imgR)
+        return np.hstack([imgL, imgR])
     
-    def _mirror_from_view(self, src_view):
-        """Copy full camera state from src view to the other view."""
-        src_cam = src_view.camera
-        dst_cam = self.camR if src_view is self.vl else self.camL
+    def cleanup(self):
+        """Explicitly release VTK/pyvista resources to avoid wglMakeCurrent spam on close."""
+        for pl in (self.plotterL, self.plotterR):
+            try:
+                # Prefer deep_clean if available (newer pyvista)
+                if hasattr(pl, "deep_clean"):
+                    pl.deep_clean()
+                else:
+                    # Fallback for older versions
+                    pl.clear()
+                    pl.close()
+            except Exception:
+                pass
+
+    def _zoom_at_cursor_for(self, plotter: QtInteractor,
+                            x: int, y: int, delta_y: int):
+        """
+        Fluid zoom anchored at the cursor for a given plotter, with no
+        artificial limits (AutoCAD-style). Works for both orthographic
+        and perspective cameras; our viewer uses parallel projection.
+        """
+        if plotter is None or delta_y == 0:
+            return
+
+        ren   = plotter.renderer
+        inter = plotter.interactor
+        cam   = plotter.camera
+        H     = inter.height()
+
+        # Prevent re-entrancy if VTK fires nested wheel events
+        if self._in_zoom:
+            return
+        self._in_zoom = True
+
         try:
-            dst_cam.set_state(src_cam.get_state())
+            # -------- helpers --------
+            def ray_through_xy(renderer, xx, yy):
+                """Return (origin, dir) of the pick ray through screen (xx, yy)."""
+                # near plane
+                renderer.SetDisplayPoint(float(xx), float(H - yy), 0.0)
+                renderer.DisplayToWorld()
+                x0, y0, z0, w0 = renderer.GetWorldPoint()
+                if abs(w0) > 1e-12:
+                    x0, y0, z0 = x0 / w0, y0 / w0, z0 / w0
+
+                # far plane
+                renderer.SetDisplayPoint(float(xx), float(H - yy), 1.0)
+                renderer.DisplayToWorld()
+                x1, y1, z1, w1 = renderer.GetWorldPoint()
+                if abs(w1) > 1e-12:
+                    x1, y1, z1 = x1 / w1, y1 / w1, z1 / w1
+
+                o = np.array([x0, y0, z0], dtype=float)
+                d = np.array([x1, y1, z1], dtype=float) - o
+                n = float(np.linalg.norm(d))
+                if n < 1e-12:
+                    # fallback: eye→focal
+                    o = np.array(cam.GetPosition(), dtype=float)
+                    d = np.array(cam.GetFocalPoint(), dtype=float) - o
+                    n = float(np.linalg.norm(d))
+                return o, (d / max(n, 1e-12))
+
+            # --- pre-zoom state & anchor on current focal plane ---
+            pos0 = np.array(cam.GetPosition(),   dtype=float)
+            fp0  = np.array(cam.GetFocalPoint(), dtype=float)
+            vu0  = np.array(cam.GetViewUp(),     dtype=float)
+
+            n0 = fp0 - pos0
+            n0n = float(np.linalg.norm(n0))
+            if n0n < 1e-12:
+                return
+            n0 /= n0n
+
+            o0, d0 = ray_through_xy(ren, x, y)
+            denom0 = float(np.dot(d0, n0))
+            if abs(denom0) < 1e-12:
+                anchor = fp0.copy()
+            else:
+                t0 = float(np.dot(fp0 - o0, n0) / denom0)
+                anchor = o0 + d0 * t0    # point under cursor on focal plane
+
+            # --- smooth zoom factor from wheel delta (like annotator) ---
+            factor = 1.2 ** (delta_y / 120.0)
+            if factor <= 0.0:
+                return
+
+            if cam.GetParallelProjection():
+                # Orthographic: zoom by changing parallel_scale and panning so
+                # the anchor stays under the cursor.
+                ps0 = cam.GetParallelScale()
+                cam.SetParallelScale(ps0 / max(1e-6, factor))
+
+                shift = (anchor - fp0) * (1.0 - 1.0 / factor)
+                cam.SetFocalPoint(*(fp0 + shift))
+                cam.SetPosition(*(pos0 + shift))
+                cam.SetViewUp(*vu0)
+            else:
+                # Perspective: move eye and focal point along ray through anchor
+                cam.SetPosition(*(anchor + (pos0 - anchor) / factor))
+                cam.SetFocalPoint(*(anchor + (fp0  - anchor) / factor))
+                cam.SetViewUp(*vu0)
+
+            # --- enforce that the post-zoom cursor ray still hits the same anchor ---
+            pos1 = np.array(cam.GetPosition(),   dtype=float)
+            fp1  = np.array(cam.GetFocalPoint(), dtype=float)
+            n1   = fp1 - pos1
+            n1n  = float(np.linalg.norm(n1))
+            if n1n >= 1e-12:
+                n1 /= n1n
+                o1, d1 = ray_through_xy(ren, x, y)
+                denom1 = float(np.dot(d1, n1))
+                if abs(denom1) > 1e-12:
+                    t1  = float(np.dot(anchor - o1, n1) / denom1)
+                    q   = o1 + d1 * t1
+                    pan = anchor - q
+                    if np.isfinite(pan).all():
+                        cam.SetPosition(*(pos1 + pan))
+                        cam.SetFocalPoint(*(fp1 + pan))
+                        cam.SetViewUp(*vu0)
+
+        finally:
+            self._in_zoom = False
+
+        # Shared camera: update clipping & render BOTH plotters once
+        try:
+            plotter.reset_camera_clipping_range()
+            self.plotterL.render()
+            self.plotterR.render()
         except Exception:
             pass
 
-    def _ray_through_canvas_xy(self, view, x, y):
-        """World-space ray through pixel (x,y) for THIS view (canvas -> scene)."""
-        scn_to_can = view.scene.node_transform(view.canvas.scene)
-        can_to_scn = scn_to_can.inverse
-        p0 = can_to_scn.map([float(x), float(y), 0.0, 1.0])  # near
-        p1 = can_to_scn.map([float(x), float(y), 1.0, 1.0])  # far
-        p0 = np.asarray(p0, float); p1 = np.asarray(p1, float)
-        p0 = p0[:3] / p0[3] if p0.shape[-1] == 4 and abs(p0[3]) > 1e-12 else p0[:3]
-        p1 = p1[:3] / p1[3] if p1.shape[-1] == 4 and abs(p1[3]) > 1e-12 else p1[:3]
-        d = p1 - p0; n = float(np.linalg.norm(d)); d = d / max(n, 1e-12)
-        return p0, d
+    def eventFilter(self, obj, event):
+        # Wheel zoom on either canvas → AutoCAD-style zoom at cursor
+        if event.type() == QtCore.QEvent.Wheel:
+            if obj is self.plotterL.interactor:
+                self._zoom_at_cursor_for(self.plotterL,
+                                         event.x(), event.y(),
+                                         event.angleDelta().y())
+                return True
+            if obj is self.plotterR.interactor:
+                self._zoom_at_cursor_for(self.plotterR,
+                                         event.x(), event.y(),
+                                         event.angleDelta().y())
+                return True
 
-    def _on_wheel(self, ev, view):
-        """AutoCAD-style zoom anchored at cursor (fast + drift-free) for the active view."""
-        try:
-            ev.handled = True
-        except Exception:
-            pass
-
-        # --- normalize wheel steps (some backends give ±120, some give ±1) ---
-        try:
-            raw = float(getattr(ev, "delta", (0, 0))[1]) if hasattr(ev, "delta") else float(ev.delta[1])
-        except Exception:
-            return
-        if raw == 0:
-            return
-        steps = raw/120.0 if abs(raw) >= 40.0 else raw  # >=40 ⇒ legacy ±120; else already in steps
-
-        # --- choose zoom base and apply keyboard modifiers ---
-        base = float(globals().get("ZOOM_BASE", 1.45))
-        try:
-            mods = QtWidgets.QApplication.keyboardModifiers()
-            if mods & QtCore.Qt.ControlModifier:
-                base = base ** 3      # coarse
-            elif mods & QtCore.Qt.ShiftModifier:
-                base = base ** (1/3)  # fine
-        except Exception:
-            pass
-
-        factor = base ** steps  # >1 zoom in, <1 zoom out
-
-        cam = view.camera  # this view's camera (we have one per view)
-        w, h = view.size
-        if w <= 0 or h <= 0:
-            return
-        x, y = float(ev.pos[0]), float(ev.pos[1])
-
-        # --- plane: pre-zoom camera-center plane, normal = center ray direction ---
-        oc, nc = self._ray_through_canvas_xy(view, 0.5 * w, 0.5 * h)  # nc is unit
-        c0 = np.array(cam.center, float)
-
-        # anchor BEFORE zoom
-        o0, d0 = self._ray_through_canvas_xy(view, x, y)
-        denom0 = float(np.dot(d0, nc))
-        if abs(denom0) < 1e-12:
-            return
-        t0 = float(np.dot(c0 - o0, nc) / denom0)
-        anchor = o0 + d0 * t0
-
-        # --- apply zoom (ortho path; perspective fallback supported) ---
-        if (getattr(cam, "fov", 0.0) or 0.0) == 0.0:
-            cam.scale_factor = float(cam.scale_factor) / max(factor, 1e-6)   # orthographic
-        else:
-            cam.distance     = float(cam.distance)     / max(factor, 1e-6)   # perspective
-
-        # anchor AFTER zoom (same pre-zoom plane)
-        o1, d1 = self._ray_through_canvas_xy(view, x, y)
-        denom1 = float(np.dot(d1, nc))
-        if abs(denom1) < 1e-12:
-            return
-        t1 = float(np.dot(c0 - o1, nc) / denom1)
-        q1 = o1 + d1 * t1
-
-        # pan to keep anchor pinned
-        pan = anchor - q1
-        if np.all(np.isfinite(pan)):
-            cam.center = (float(c0[0] + pan[0]), float(c0[1] + pan[1]), float(c0[2] + pan[2]))
-
-        # mirror to the other camera and refresh both
-        self._mirror_from_view(view)
-        try:
-            self.left.update(); self.right.update()
-        except Exception:
-            pass
+        return super().eventFilter(obj, event)
 
 # ---------------- Main window -------------------
 class ReviewerApp(QtWidgets.QMainWindow):
@@ -625,8 +808,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
         top.addWidget(self.btn_export_xl)
         v.addLayout(top)
 
-        # canvases (VisPy)
-        self.canvas = DualCanvasVispy(self); v.addWidget(self.canvas, 1)
+        # canvases (PyVista)
+        self.canvas = DualCanvasPyVista(self)
+        v.addWidget(self.canvas, 1)
 
         # bottom controls
         grid=QtWidgets.QGridLayout(); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(4)
@@ -769,7 +953,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
             self.settings["last_stem"] = self.stems[self.idx]
         save_settings(self.settings)
 
-    # ----- plotting helpers (VisPy)
+    # ----- plotting helpers (PyVista)
     def update_scene(self, *, first=False):
         if self.total==0: return
         self.canvas.clear()
@@ -791,29 +975,29 @@ class ReviewerApp(QtWidgets.QMainWindow):
         # left: original
         if orig is not None and len(orig.points)>0:
             xyzL, cL = pc_to_xyz_rgb(orig)
-            self.canvas.set_left(xyzL, cL, self.point_size*MARKER_SCALE_VISPY)
+            self.canvas.set_left(xyzL, cL, self.point_size*MARKER_SCALE)
         else:
-            self.canvas.set_left(None, None, self.point_size*MARKER_SCALE_VISPY)
+            self.canvas.set_left(None, None, self.point_size*MARKER_SCALE)
 
         # right: overlay vs as-is
         if self.overlay_mode:
             # base = original colors
             if orig is not None and len(orig.points)>0:
                 xyzB, cB = pc_to_xyz_rgb(orig)
-                self.canvas.set_right_base(xyzB, cB, self.point_size*MARKER_SCALE_VISPY)
+                self.canvas.set_right_base(xyzB, cB, self.point_size*MARKER_SCALE)
             else:
-                self.canvas.set_right_base(None, None, self.point_size*MARKER_SCALE_VISPY)
+                self.canvas.set_right_base(None, None, self.point_size*MARKER_SCALE)
 
             # overlay = red in annotation
             if anno is not None and len(anno.points)>0:
                 xyzA, cA = pc_to_xyz_rgb(anno)
                 m = red_mask(cA)
                 if self.show_annotations and np.any(m):
-                    self.canvas.set_right_overlay(xyzA[m], cA[m], self.point_size*MARKER_SCALE_VISPY)
+                    self.canvas.set_right_overlay(xyzA[m], cA[m], self.point_size*MARKER_SCALE)
                 else:
-                    self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE_VISPY)
+                    self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE)
             else:
-                self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE_VISPY)
+                self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE)
         else:
             # annotation as-is (split so red draws on top)
             if anno is not None and len(anno.points) > 0:
@@ -822,19 +1006,19 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
                 # draw non-red first as base
                 if np.any(~m):
-                    self.canvas.set_right_base(xyzR[~m], cR[~m], self.point_size * MARKER_SCALE_VISPY)
+                    self.canvas.set_right_base(xyzR[~m], cR[~m], self.point_size * MARKER_SCALE)
                 else:
-                    self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE_VISPY)
+                    self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE)
                     
                 # then draw red on top (depth_test=False inside set_right_overlay)
                 if self.show_annotations and np.any(m):
-                    self.canvas.set_right_overlay(xyzR[m], cR[m], self.point_size * MARKER_SCALE_VISPY)
+                    self.canvas.set_right_overlay(xyzR[m], cR[m], self.point_size * MARKER_SCALE)
                 else:
-                    self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE_VISPY)
+                    self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE)
 
             else:
-                self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE_VISPY)
-                self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE_VISPY)
+                self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE)
+                self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE)
 
         self.setWindowTitle(f"{APP_NAME} — {file_name}   ({self.idx+1}/{self.total})")
 
@@ -875,11 +1059,11 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.canvas.set_titles("Original", "Annotation (overlay)" if self.overlay_mode else "Annotation")
         self.update_scene()
 
-    # ----- slider (instant with VisPy)
+    # ----- slider (instant with PyVista)
     def on_slider(self, val: int):
         self.point_size = max(0.1, val/10.0)
         self.lbl_ps_val.setText(f"{self.point_size:.1f}")
-        self.canvas.set_point_size(self.point_size*MARKER_SCALE_VISPY)
+        self.canvas.set_point_size(self.point_size*MARKER_SCALE)
         
     def on_alpha_slider(self, val: int):
         alpha = max(0.0, min(1.0, val / 100.0))
@@ -903,30 +1087,49 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):  # QCloseEvent
         self._remember_position()
-        super().closeEvent(event) 
+        # NEW: explicitly clean up PyVista to prevent wglMakeCurrent errors
+        try:
+            if hasattr(self, "canvas") and hasattr(self.canvas, "cleanup"):
+                self.canvas.cleanup()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def save_comment(self):
         if self.total == 0:
             return
-        name = self.stems[self.idx]                     # existing key (index-prefixed relpath)
+
+        name   = self.stems[self.idx]          # index-prefixed relpath key
         anno_p = self.anno_map.get(name)
         abs_key = os.path.abspath(anno_p) if anno_p else None
 
         txt = self.txt_comment.toPlainText().strip()
+
         if not txt:
-            # Do NOT delete on empty text (protects comments during revise/autosave)
+            # CLEAR comment if text box is empty
+            changed = False
+            if abs_key and abs_key in self.comments:
+                self.comments.pop(abs_key, None)
+                changed = True
+            if name in self.comments:
+                self.comments.pop(name, None)
+                changed = True
+            if changed:
+                save_comments(self.comments)
+                self.status.showMessage(
+                    f"Comment cleared for {abs_key or name} → {COMMENTS}", 2000
+                )
             return
 
-        # Primary: absolute annotation path (collision-proof, future-proof)
+        # otherwise, SAVE / UPDATE comment
         if abs_key:
             self.comments[abs_key] = txt
-
-        # Secondary: keep writing legacy key for backward compatibility
-        self.comments[name] = txt
+        self.comments[name] = txt  # legacy key for compatibility
 
         save_comments(self.comments)
-        self.status.showMessage(f"Comment saved for {abs_key or name} → {COMMENTS}", 2000)
-
+        self.status.showMessage(
+            f"Comment saved for {abs_key or name} → {COMMENTS}", 2000
+        )
 
     def move_to_revise(self):
         if self.total==0: return
@@ -990,9 +1193,13 @@ class ReviewerApp(QtWidgets.QMainWindow):
             self.update_scene()
 
     def save_png(self):
-        if self.total==0: return
-        name=self.stems[self.idx]
-        out=f"{name}.png"
+        if self.total == 0:
+            return
+
+        name = self.stems[self.idx]
+        safe_name = name.replace("/", "_").replace("\\", "_")
+        out = f"{safe_name}.png"
+
         try:
             rgba = self.canvas.screenshot_rgba()   # (H, W, 4) uint8
             Image.fromarray(rgba).save(out)

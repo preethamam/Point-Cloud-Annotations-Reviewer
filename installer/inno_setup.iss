@@ -2,7 +2,7 @@
 ; SEE THE DOCUMENTATION FOR DETAILS ON CREATING INNO SETUP SCRIPT FILES!
 
 #define MyAppName "Point Cloud Reviewer"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "Preetham Manjunatha"
 #define MyAppURL "https://preethamam.github.io/"
 #define MyAppExeName "Point Cloud Reviewer.exe"
@@ -16,6 +16,7 @@
 AppId={{0FEFE25B-1153-4C79-BBE6-6A3C70CB0D3E}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+VersionInfoVersion={#MyAppVersion}
 ;AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}

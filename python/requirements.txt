@@ -1,5 +1,6 @@
 PyQt5
-vispy
+pyvista
+vtk
 open3d
 numpy
 pandas

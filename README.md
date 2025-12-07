@@ -1,4 +1,4 @@
-# Point Cloud Reviewer (PyQt5 + VisPy)
+# Point Cloud Reviewer (PyQt5 + PyVista)
 
 Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load your “Original” dataset on the left and the corresponding “Annotation” on the right, then toggle between “Overlay on Original” and “Annotation as‑is” views. The app persists folders, last position, and per‑scene comments, and can export a consolidated Excel report.
 
@@ -8,7 +8,7 @@ Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load yo
 
 ## Highlights
 
-- Fast rendering on millions of points using VisPy (OpenGL) with compact UI
+- Fast rendering on millions of points using PyVista (OpenGL/VTK) with compact UI
 - Side‑by‑side view with synchronized camera (rotate/pan/zoom mirrored)
 - Overlay mode: render red annotation points on top of the original cloud
 - Transparency: controls the transparency of the annotations
@@ -63,13 +63,14 @@ Color convention for “red annotations” (overlay filter):
 
 - Windows 10/11, Linux, or macOS (primary development on Windows)
 - Python 3.9–3.12 recommended
-- GPU/driver supporting OpenGL (VisPy uses OpenGL via PyQt5)
+- GPU/driver supporting OpenGL (PyVista uses OpenGL via PyQt5)
 - For Windows + Open3D: Microsoft Visual C++ Redistributable (2015–2022) may be required
 
 ### Dependencies (runtime)
 
 - PyQt5
-- vispy
+- pyvista
+- VTK
 - open3d
 - numpy
 - pandas (for Excel export)
@@ -195,7 +196,7 @@ Settings highlights:
 
 ## 10) Rendering Details & Performance
 
-- Renderer: VisPy Markers visuals (OpenGL) for very fast point drawing.
+- Renderer: PyVista Markers visuals (OpenGL/VTK) for very fast point drawing.
 - Synchronized cameras: two Turntable cameras kept in lockstep.
 - Zoom: anchored at cursor with orthographic scale adjustment (fov=0) or distance change (perspective fallback).
 - Automatic decimation: point clouds are randomly subsampled to `MAX_PTS = 2_000_000` for interactivity.
@@ -208,8 +209,7 @@ Tunable constants (edit in `app.py`):
 - `MAX_PTS = 2_000_000`
 - `COMMENT_BOX_HEIGHT = 40`
 - `SLIDER_WIDTH_PX = 180`
-- `MARKER_SCALE_VISPY = 1.0`
-- `ZOOM_BASE = 1.25`
+- `MARKER_SCALE = 1.0`
 
 Tips:
 
@@ -227,9 +227,9 @@ Tips:
 
 ## 12) Packaging as an Executable (optional)
 
-You can bundle the app with PyInstaller. VisPy and Open3D require some care:
+You can bundle the app with PyInstaller. PyVista and Open3D require some care:
 
-- Include the Qt plugins and VisPy assets; PyInstaller hooks generally handle this, but you may need to collect data.
+- Include the Qt plugins and PyVista assets; PyInstaller hooks generally handle this, but you may need to collect data.
 - Open3D wheels are large and ship many binaries; ensure they’re included.
 
 Example (adjust as needed):
@@ -243,13 +243,12 @@ pyinstaller --noconfirm `
   --icon .\python\app.ico `
   --add-data ".\python\icon.png;." `
   --add-data ".\python\app.ico;." `
-  --collect-all vispy `
   .\python\app.py
 ```
 
 Common packaging issues:
 
-- Missing Qt plugins on target machine → ensure `--collect-data vispy` and PyQt5 plugins are bundled.
+- Missing Qt plugins on target machine → ensure PyQt5 plugins are bundled.
 - OpenGL context errors → update GPU drivers; test on target hardware.
 
 ---
@@ -259,7 +258,7 @@ Common packaging issues:
 - Blank or white canvases
 
   - Cause: OpenGL context issues or outdated GPU drivers.
-  - Fix: Update graphics drivers; verify OpenGL support; try a simpler VisPy example.
+  - Fix: Update graphics drivers; verify OpenGL support; try a simpler PyVista example.
 - Open3D import errors on Windows
 
   - Cause: Missing MSVC redistributables.
@@ -298,9 +297,9 @@ This project is licensed under the MIT License — see `../LICENSE`.
 
 - `python/app.py`
 
-  - PyQt5 main window with top controls, dual VisPy canvases, and bottom panel.
+  - PyQt5 main window with top controls, dual PyVista canvases, and bottom panel.
   - Folder dialog with multi‑select lists for Original/Annotation/Revise and reordering.
-  - VisPy dual canvas (`DualCanvasVispy`): synchronized cameras, anchored zoom, split overlay pipeline.
+  - PyVista dual canvas (`DualCanvasPyVista`): synchronized cameras, anchored zoom, split overlay pipeline.
   - File discovery: annotation list drives iteration; originals located by stem across Original roots.
   - Persistence: `settings.json` and `comments.json` under Local AppData.
   - Export: Excel via pandas/openpyxl; PNG composite via Pillow; progress via tqdm.
