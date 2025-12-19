@@ -13,6 +13,7 @@ Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load yo
 - Overlay mode: render red annotation points on top of the original cloud
 - Transparency: controls the transparency of the annotations
 - As‑is mode: show the annotation cloud, with red points drawn above others
+- Views: shows the top, bottom and isometric views with their shortcuts
 - Per‑scene comments stored locally; export to Excel
 - Progress indicator and “Revise” workflow (move files to revision folders)
 - Natural filename sorting; continues where you left off across sessions
@@ -132,6 +133,7 @@ Notes:
 - Right canvas:
   - Overlay mode: Original as base + red points from Annotation drawn on top.
   - As‑is mode: Annotation cloud split into non‑red (base) and red (overlay) so red draws above.
+- Views: shows the top, bottom and isometric views with their shortcuts
 - Camera is synchronized across canvases. Rotate/pan/zoom on either side and the other follows.
 - Mouse wheel zoom is anchored at the cursor (AutoCAD‑style): hold Ctrl for coarse, Shift for fine steps.
 - Point Size slider updates instantly on both canvases.
@@ -147,6 +149,9 @@ Notes:
 - M: Move current annotation file to the corresponding Revise folder
 - ← / →: Previous / Next file
 - Ctrl+S: Save composite PNG (both canvases side‑by‑side)
+- Ctrl+T: Top view
+- Ctrl+B: Bottom view
+- Ctrl+I: Isometric view
 
 All toggles work outside text inputs with plain keypress, or anywhere with Shift+key.
 
@@ -199,6 +204,7 @@ Settings highlights:
 - Renderer: PyVista Markers visuals (OpenGL/VTK) for very fast point drawing.
 - Synchronized cameras: two Turntable cameras kept in lockstep.
 - Zoom: anchored at cursor with orthographic scale adjustment (fov=0) or distance change (perspective fallback).
+- Views: shows the top, bottom and isometric views with their shortcuts
 - Automatic decimation: point clouds are randomly subsampled to `MAX_PTS = 2_000_000` for interactivity.
 - Marker scale: controlled by the Point Size slider.
 - Transparency: controlled by the Transparency slider
