@@ -524,7 +524,7 @@ class DualCanvasPyVista(QtWidgets.QWidget):
 
 
     def reset_view(self):
-        self.fit_to_data_top()
+        pass
 
     # ------------------------------------------------------------------
     # Screenshot
@@ -781,6 +781,15 @@ class ReviewerApp(QtWidgets.QMainWindow):
         central=QtWidgets.QWidget(self); self.setCentralWidget(central)
         v=QtWidgets.QVBoxLayout(central); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
 
+        # --- NEW: View mode combo (Top / Bottom / Isometric) ---
+        self.view_combo = QtWidgets.QComboBox()
+        self.view_combo.addItems([
+            "Top view (Ctrl+T)",
+            "Bottom view (Ctrl+B)",
+            "Isometric view (Ctrl+I)",
+        ])
+        self.view_combo.currentIndexChanged.connect(lambda _=None: self.apply_view(fit=True))
+    
         # top bar
         top=QtWidgets.QHBoxLayout()
         self.btn_folders   = QtWidgets.QPushButton("Folders")
@@ -798,6 +807,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
         self.btn_export_xl = QtWidgets.QPushButton("Export Excel")
         top.addWidget(self.btn_folders)
+        top.addWidget(self.view_combo)
         top.addStretch(1)
         top.addWidget(self.chk_overlay)
         top.addSpacing(10)
@@ -847,6 +857,19 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.sld_alpha.setFixedWidth(SLIDER_WIDTH_PX)
         self.lbl_alpha_val = QtWidgets.QLabel("100%")
         self.lbl_alpha.setContentsMargins(12,0,6,0)     # a tiny gap from point size
+
+        # --- View shortcuts (Ctrl+T / Ctrl+B / Ctrl+I) ---
+        sc_top = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+T"), self)
+        sc_top.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_top.activated.connect(lambda: self.view_combo.setCurrentIndex(0))
+
+        sc_bottom = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+B"), self)
+        sc_bottom.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_bottom.activated.connect(lambda: self.view_combo.setCurrentIndex(1))
+
+        sc_iso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+I"), self)
+        sc_iso.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_iso.activated.connect(lambda: self.view_combo.setCurrentIndex(2))
 
         # comment rows — span ALL 13 columns
         grid.addWidget(self.lbl_comment, 0, 0, 1, 16)
@@ -1043,6 +1066,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         
         # fit to canvas in top view every time a new scene is loaded
         self.canvas.fit_to_data_top()
+        self.apply_view()
         
         # at the end of update_scene()
         self.canvas.set_titles(
@@ -1050,6 +1074,114 @@ class ReviewerApp(QtWidgets.QMainWindow):
             "Annotation (overlay)" if self.overlay_mode else "Annotation"
         )
 
+    def apply_view(self, *, fit=False):
+        cam = self.canvas.plotterL.camera
+        txt = self.view_combo.currentText()
+
+        # ---------- TOP ----------
+        if txt == "Top view (Ctrl+T)":
+            cam.ParallelProjectionOn()
+            cam.SetViewUp(0, 1, 0)
+
+            if fit:
+                # This already sets a correct top-down camera + parallel_scale
+                self.canvas.fit_to_data_top()
+
+            # render once
+            self.canvas.plotterL.reset_camera_clipping_range()
+            self.canvas.plotterL.render()
+            self.canvas.plotterR.render()
+            return
+
+        # ---------- BOTTOM ----------
+        if txt == "Bottom view (Ctrl+B)":
+            cam.ParallelProjectionOn()
+            cam.SetViewUp(0, 1, 0)
+
+            if fit:
+                # Fit as top first (gives correct framing + parallel_scale),
+                # then flip camera to the opposite side of the focal point.
+                self.canvas.fit_to_data_top()
+
+            pos = np.array(cam.GetPosition(), dtype=float)
+            fp  = np.array(cam.GetFocalPoint(), dtype=float)
+
+            # flip around focal: pos' = fp - (pos - fp)
+            pos2 = fp - (pos - fp)
+            cam.SetPosition(*pos2)
+            cam.SetFocalPoint(*fp)
+
+            self.canvas.plotterL.reset_camera_clipping_range()
+            self.canvas.plotterL.render()
+            self.canvas.plotterR.render()
+            return
+
+        # ---------- ISOMETRIC (South-West) ----------
+        cam.ParallelProjectionOff()
+        cam.SetViewUp(0, 0, 1)
+
+        if fit:
+            self._fit_bounds_iso_sw()
+            self.canvas.plotterL.reset_camera_clipping_range()
+            self.canvas.plotterL.render()
+            self.canvas.plotterR.render()
+            return
+
+        # If not fitting, just enforce SW direction while keeping current distance
+        pos = np.array(cam.GetPosition(), dtype=float)
+        fp  = np.array(cam.GetFocalPoint(), dtype=float)
+        dist = float(np.linalg.norm(pos - fp)) or 1.0
+
+        dop = np.array([1.0, 1.0, -1.0], dtype=float)  # direction from camera -> focal
+        dop /= np.linalg.norm(dop)
+
+        # SW camera position is opposite of dop
+        cam.SetPosition(*(fp - dop * dist))
+        cam.SetFocalPoint(*fp)
+
+        self.canvas.plotterL.reset_camera_clipping_range()
+        self.canvas.plotterL.render()
+        self.canvas.plotterR.render()
+
+    def _fit_bounds_iso_sw(self):
+        xyz_list = []
+        for arr in (self.canvas._xyzL, self.canvas._xyzRB, self.canvas._xyzRO):
+            if arr is not None and len(arr):
+                xyz_list.append(arr)
+        if not xyz_list:
+            return
+
+        xyz = np.vstack(xyz_list).astype(np.float64)
+        mn, mx = xyz.min(axis=0), xyz.max(axis=0)
+        center = 0.5 * (mn + mx)
+        extent = mx - mn
+
+        # bounding sphere radius (safe for any orientation)
+        radius = 0.5 * float(np.linalg.norm(extent))
+        radius = max(radius, 1e-6)
+
+        cam = self.canvas.plotterL.camera
+
+        # FOV-aware distance (fits sphere into view)
+        # VTK view angle is vertical FOV in degrees
+        fov_v = float(cam.GetViewAngle()) or 30.0
+        theta_v = np.deg2rad(fov_v) * 0.5
+
+        w, h = self.canvas.plotterL.window_size
+        aspect = (float(w) / float(h)) if h else 1.0
+        theta_h = np.arctan(np.tan(theta_v) * aspect)
+
+        theta = min(theta_v, theta_h)
+        dist = radius / max(np.sin(theta), 1e-6)
+        dist *= 1.10  # small margin
+
+        # SOUTH-WEST isometric: camera located at (-X, -Y, +Z)
+        # dop = direction from camera -> focal
+        dop = np.array([1.0, 1.0, -1.0], dtype=float)
+        dop /= np.linalg.norm(dop)
+
+        cam.SetFocalPoint(*center)
+        cam.SetPosition(*(center - dop * dist))
 
     # ——— overlay toggle ————————————————————————————————————————
     def toggle_overlay(self, checked: bool):
@@ -1338,7 +1470,8 @@ class ReviewerApp(QtWidgets.QMainWindow):
             break
         
     def reset_view(self):
-        self.canvas.reset_view()
+        # Re-apply CURRENT view mode and refit appropriately
+        self.apply_view(fit=True)
         
     
     def eventFilter(self, obj, ev):        
