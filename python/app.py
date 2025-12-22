@@ -39,6 +39,7 @@ MAX_PTS                = 2_000_000     # interactive decimation cap
 COMMENT_BOX_HEIGHT     = 40            # tweak comment box height here
 SLIDER_WIDTH_PX        = 180           # compact slider width (pixels)
 MARKER_SCALE           = 1.0           # Marker size = slider_value * this factor
+ISO_ELEV               = 35.264        # CAD magic angle (≈ arcsin(1/√3) for true isometric)
 # ==============================================================================
 
 LOCALAPP = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData/Local")
@@ -786,7 +787,14 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.view_combo.addItems([
             "Top view (Ctrl+T)",
             "Bottom view (Ctrl+B)",
-            "Isometric view (Ctrl+I)",
+            "Front view (Ctrl+F)",
+            "Back view (Ctrl+V)",
+            "Left view (Ctrl+L)",
+            "Right view (Ctrl+R)",
+            "SW Isometric view (Ctrl+W)",
+            "SE Isometric view (Ctrl+E)",
+            "NW Isometric view (Ctrl+I)",
+            "NE Isometric view (Ctrl+O)",
         ])
         self.view_combo.currentIndexChanged.connect(lambda _=None: self.apply_view(fit=True))
     
@@ -858,7 +866,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.lbl_alpha_val = QtWidgets.QLabel("100%")
         self.lbl_alpha.setContentsMargins(12,0,6,0)     # a tiny gap from point size
 
-        # --- View shortcuts (Ctrl+T / Ctrl+B / Ctrl+I) ---
+        # --- View shortcuts (Ctrl+T / Ctrl+B / Ctrl+F / Ctrl+V / Ctrl+L / Ctrl+R / Ctrl+W / Ctrl+E / Ctrl+I / Ctrl+O) ---
         sc_top = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+T"), self)
         sc_top.setContext(QtCore.Qt.ApplicationShortcut)
         sc_top.activated.connect(lambda: self.view_combo.setCurrentIndex(0))
@@ -867,9 +875,37 @@ class ReviewerApp(QtWidgets.QMainWindow):
         sc_bottom.setContext(QtCore.Qt.ApplicationShortcut)
         sc_bottom.activated.connect(lambda: self.view_combo.setCurrentIndex(1))
 
-        sc_iso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+I"), self)
-        sc_iso.setContext(QtCore.Qt.ApplicationShortcut)
-        sc_iso.activated.connect(lambda: self.view_combo.setCurrentIndex(2))
+        sc_front = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+F"), self)
+        sc_front.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_front.activated.connect(lambda: self.view_combo.setCurrentIndex(2))
+        
+        sc_back = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+V"), self)
+        sc_back.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_back.activated.connect(lambda: self.view_combo.setCurrentIndex(3))
+        
+        sc_left = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+L"), self)
+        sc_left.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_left.activated.connect(lambda: self.view_combo.setCurrentIndex(4))
+        
+        sc_right = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+R"), self)
+        sc_right.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_right.activated.connect(lambda: self.view_combo.setCurrentIndex(5))
+
+        sc_swiso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+W"), self)
+        sc_swiso.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_swiso.activated.connect(lambda: self.view_combo.setCurrentIndex(6))
+        
+        sc_seiso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+E"), self)
+        sc_seiso.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_seiso.activated.connect(lambda: self.view_combo.setCurrentIndex(7))
+        
+        sc_nwiso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+I"), self)
+        sc_nwiso.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_nwiso.activated.connect(lambda: self.view_combo.setCurrentIndex(8))
+        
+        sc_neiso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+O"), self)
+        sc_neiso.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_neiso.activated.connect(lambda: self.view_combo.setCurrentIndex(9))
 
         # comment rows — span ALL 13 columns
         grid.addWidget(self.lbl_comment, 0, 0, 1, 16)
@@ -1114,74 +1150,213 @@ class ReviewerApp(QtWidgets.QMainWindow):
             self.canvas.plotterL.reset_camera_clipping_range()
             self.canvas.plotterL.render()
             self.canvas.plotterR.render()
+            return        
+                
+        # FRONT: camera at +Y looking toward -Y → dop = (0, -1, 0) → az=270°
+        if txt == "Front view (Ctrl+F)":
+            if fit:
+                self._set_cad_view(azimuth_deg=90, elevation_deg=0)  # was 90
             return
 
-        # ---------- ISOMETRIC (South-West) ----------
-        cam.ParallelProjectionOff()
-        cam.SetViewUp(0, 0, 1)
-
-        if fit:
-            self._fit_bounds_iso_sw()
-            self.canvas.plotterL.reset_camera_clipping_range()
-            self.canvas.plotterL.render()
-            self.canvas.plotterR.render()
+        # BACK: camera at -Y looking toward +Y → dop = (0, 1, 0) → az=90°
+        if txt == "Back view (Ctrl+V)":
+            if fit:
+                self._set_cad_view(azimuth_deg=270, elevation_deg=0)  # was 270
             return
 
-        # If not fitting, just enforce SW direction while keeping current distance
-        pos = np.array(cam.GetPosition(), dtype=float)
-        fp  = np.array(cam.GetFocalPoint(), dtype=float)
-        dist = float(np.linalg.norm(pos - fp)) or 1.0
+        # LEFT: camera at -X looking toward +X → dop = (1, 0, 0) → az=0°
+        if txt == "Left view (Ctrl+L)":
+            if fit:
+                self._set_cad_view(azimuth_deg=0, elevation_deg=0)  # was 180
+            return
 
-        dop = np.array([1.0, 1.0, -1.0], dtype=float)  # direction from camera -> focal
-        dop /= np.linalg.norm(dop)
+        # RIGHT: camera at +X looking toward -X → dop = (-1, 0, 0) → az=180°
+        if txt == "Right view (Ctrl+R)":
+            if fit:
+                self._set_cad_view(azimuth_deg=180, elevation_deg=0)  # was 0
+            return
 
-        # SW camera position is opposite of dop
-        cam.SetPosition(*(fp - dop * dist))
-        cam.SetFocalPoint(*fp)
+        # SW ISO: camera at (-X, -Y, +Z) → dop = (0.577, 0.577, -0.577) → az=45°, el=-35.264°
+        if txt == "SW Isometric view (Ctrl+W)":
+            if fit:
+                self._set_cad_view(azimuth_deg=45, elevation_deg=-ISO_ELEV)  # was 225, +ISO_ELEV
+            return
 
-        self.canvas.plotterL.reset_camera_clipping_range()
-        self.canvas.plotterL.render()
-        self.canvas.plotterR.render()
+        # SE ISO: camera at (+X, -Y, +Z) → dop = (-0.577, 0.577, -0.577) → az=135°, el=-35.264°
+        if txt == "SE Isometric view (Ctrl+E)":
+            if fit:
+                self._set_cad_view(azimuth_deg=135, elevation_deg=-ISO_ELEV)  # was 315, +ISO_ELEV
+            return
 
-    def _fit_bounds_iso_sw(self):
+        # NW ISO: camera at (-X, +Y, +Z) → dop = (0.577, -0.577, -0.577) → az=315°, el=-35.264°
+        if txt == "NW Isometric view (Ctrl+I)":
+            if fit:
+                self._set_cad_view(azimuth_deg=315, elevation_deg=-ISO_ELEV)  # was 135, +ISO_ELEV
+            return
+
+        # NE ISO: camera at (+X, +Y, +Z) → dop = (-0.577, -0.577, -0.577) → az=225°, el=-35.264°
+        if txt == "NE Isometric view (Ctrl+O)":
+            if fit:
+                self._set_cad_view(azimuth_deg=225, elevation_deg=-ISO_ELEV)  # was 45, +ISO_ELEV
+            return
+
+
+    def _all_xyz(self) -> Optional[np.ndarray]:
         xyz_list = []
         for arr in (self.canvas._xyzL, self.canvas._xyzRB, self.canvas._xyzRO):
             if arr is not None and len(arr):
                 xyz_list.append(arr)
         if not xyz_list:
+            return None
+        return np.vstack(xyz_list).astype(np.float64)
+
+    def _fit_view_parallel(self, dop: np.ndarray, viewup: Tuple[float, float, float]):
+        """
+        CAD-style fit:
+        - Parallel projection (orthographic)
+        - Fixed view direction (dop) and viewup (no roll)
+        - parallel_scale computed from projected extents (no wobble)
+        """
+        xyz = self._all_xyz()
+        if xyz is None:
             return
 
-        xyz = np.vstack(xyz_list).astype(np.float64)
         mn, mx = xyz.min(axis=0), xyz.max(axis=0)
         center = 0.5 * (mn + mx)
-        extent = mx - mn
-
-        # bounding sphere radius (safe for any orientation)
-        radius = 0.5 * float(np.linalg.norm(extent))
-        radius = max(radius, 1e-6)
 
         cam = self.canvas.plotterL.camera
 
-        # FOV-aware distance (fits sphere into view)
-        # VTK view angle is vertical FOV in degrees
-        fov_v = float(cam.GetViewAngle()) or 30.0
-        theta_v = np.deg2rad(fov_v) * 0.5
+        dop = np.asarray(dop, dtype=np.float64)
+        dop /= max(np.linalg.norm(dop), 1e-12)
 
+        up = np.asarray(viewup, dtype=np.float64)
+        up /= max(np.linalg.norm(up), 1e-12)
+
+        # Build an orthonormal camera basis (right, true_up, -dop)
+        right = np.cross(dop, up)
+        nr = np.linalg.norm(right)
+        if nr < 1e-12:
+            # fallback if dop ∥ up (shouldn't happen with our presets)
+            up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            right = np.cross(dop, up)
+            nr = max(np.linalg.norm(right), 1e-12)
+        right /= nr
+        true_up = np.cross(right, dop)
+        true_up /= max(np.linalg.norm(true_up), 1e-12)
+
+        # Project points onto view plane axes (right = horizontal, true_up = vertical)
+        d = xyz - center
+        u = d @ right
+        v = d @ true_up
+
+        span_u = float(u.max() - u.min())
+        span_v = float(v.max() - v.min())
+
+        # Window aspect ratio
         w, h = self.canvas.plotterL.window_size
         aspect = (float(w) / float(h)) if h else 1.0
-        theta_h = np.arctan(np.tan(theta_v) * aspect)
 
-        theta = min(theta_v, theta_h)
-        dist = radius / max(np.sin(theta), 1e-6)
-        dist *= 1.10  # small margin
+        # For VTK parallel camera:
+        # visible_height = 2 * parallel_scale
+        # visible_width  = 2 * parallel_scale * aspect
+        # => parallel_scale must satisfy both height and width constraints
+        margin = 1.08
+        needed_height = span_v
+        needed_height_from_width = span_u / max(aspect, 1e-12)
+        cam.parallel_scale = 0.5 * max(needed_height, needed_height_from_width, 1e-6) * margin
 
-        # SOUTH-WEST isometric: camera located at (-X, -Y, +Z)
-        # dop = direction from camera -> focal
-        dop = np.array([1.0, 1.0, -1.0], dtype=float)
+        # Place camera some distance away (distance doesn't affect scale in parallel projection)
+        extent = mx - mn
+        dist = float(np.linalg.norm(extent)) or 1.0
+        pos = center - dop * (dist * 2.5)
+
+        cam.ParallelProjectionOn()
+        cam.SetFocalPoint(*center)
+        cam.SetPosition(*pos)
+        cam.SetViewUp(*true_up)
+        cam.OrthogonalizeViewUp()
+
+        self.canvas.plotterL.reset_camera_clipping_range()
+        self.canvas.plotterL.render()
+        self.canvas.plotterR.render()
+
+    def _fit_bounds_front(self):
+        # looking from +Y toward origin => dop = (0, -1, 0)
+        self._fit_view_parallel(dop=np.array([0.0, -1.0, 0.0]), viewup=(0.0, 0.0, 1.0))
+
+    def _fit_bounds_back(self):
+        self._fit_view_parallel(dop=np.array([0.0, 1.0, 0.0]), viewup=(0.0, 0.0, 1.0))
+
+    def _fit_bounds_left(self):
+        # looking from -X toward origin => dop = (1, 0, 0)
+        self._fit_view_parallel(dop=np.array([1.0, 0.0, 0.0]), viewup=(0.0, 0.0, 1.0))
+
+    def _fit_bounds_right(self):
+        self._fit_view_parallel(dop=np.array([-1.0, 0.0, 0.0]), viewup=(0.0, 0.0, 1.0))
+
+    def _fit_bounds_iso(self, dop):
+        self._fit_view_parallel(dop=np.array(dop, dtype=float), viewup=(0.0, 0.0, 1.0))
+
+    def _set_cad_view(self, *, azimuth_deg, elevation_deg):
+        """
+        CAD-style orthographic camera:
+        - Fixed azimuth & elevation (no wobble)
+        - No roll
+        - Parallel projection
+        - Scale fitted once using projected extents
+        """
+        xyz = self._all_xyz()
+        if xyz is None:
+            return
+
+        mn, mx = xyz.min(axis=0), xyz.max(axis=0)
+        center = 0.5 * (mn + mx)
+
+        cam = self.canvas.plotterL.camera
+        cam.ParallelProjectionOn()
+
+        # --- compute direction from azimuth/elevation ---
+        az = np.deg2rad(azimuth_deg)
+        el = np.deg2rad(elevation_deg)
+
+        dop = np.array([
+            np.cos(el) * np.cos(az),
+            np.cos(el) * np.sin(az),
+            np.sin(el)
+        ], dtype=float)
         dop /= np.linalg.norm(dop)
 
+        # CAD up is always +Z
+        viewup = np.array([0.0, 0.0, 1.0])
+
+        # Orthonormalize (prevents roll)
+        right = np.cross(dop, viewup)
+        right /= max(np.linalg.norm(right), 1e-12)
+        true_up = np.cross(right, dop)
+
+        # Project extents
+        d = xyz - center
+        u = d @ right
+        v = d @ true_up
+
+        span_u = np.ptp(u)
+        span_v = np.ptp(v)
+
+        w, h = self.canvas.plotterL.window_size
+        aspect = w / max(h, 1)
+
+        cam.parallel_scale = 0.5 * max(span_v, span_u / aspect) * 1.08
+
+        # Camera distance is arbitrary in parallel projection
+        dist = np.linalg.norm(mx - mn) * 3.0
         cam.SetFocalPoint(*center)
         cam.SetPosition(*(center - dop * dist))
+        cam.SetViewUp(*true_up)
+        cam.OrthogonalizeViewUp()
+
+        self.canvas.plotterL.reset_camera_clipping_range()
+        self.canvas.plotterL.render()
+        self.canvas.plotterR.render()
 
     # ——— overlay toggle ————————————————————————————————————————
     def toggle_overlay(self, checked: bool):
