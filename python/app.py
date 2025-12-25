@@ -1100,9 +1100,8 @@ class ReviewerApp(QtWidgets.QMainWindow):
             
         self.status.showMessage(f"Viewing: {file_name}")
         
-        # fit to canvas in top view every time a new scene is loaded
-        self.canvas.fit_to_data_top()
-        self.apply_view()
+        # fit according to CURRENT view mode
+        self.apply_view(fit=True)
         
         # at the end of update_scene()
         self.canvas.set_titles(
