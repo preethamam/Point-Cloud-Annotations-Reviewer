@@ -757,6 +757,10 @@ class ReviewerApp(QtWidgets.QMainWindow):
             # mark the first item as already visited
             self._seen.add(self.stems[self.idx])
         self.point_size = 5.0    # slider shows this
+        
+        # --- NEW: loop playback state ---
+        self.loop_timer = QtCore.QTimer(self)
+        self.loop_timer.timeout.connect(lambda: self.shift(1))
 
         # jump to last position if enabled and available
         if self.total and self.settings.get("continue_where_left", True):
@@ -907,28 +911,50 @@ class ReviewerApp(QtWidgets.QMainWindow):
         sc_neiso.setContext(QtCore.Qt.ApplicationShortcut)
         sc_neiso.activated.connect(lambda: self.view_combo.setCurrentIndex(9))
 
-        # comment rows — span ALL 13 columns
-        grid.addWidget(self.lbl_comment, 0, 0, 1, 16)
-        grid.addWidget(self.txt_comment, 1, 0, 1, 16)
-
+        # comment rows — span ALL 20 columns
+        grid.addWidget(self.lbl_comment, 0, 0, 1, 20)
+        grid.addWidget(self.txt_comment, 1, 0, 1, 20)
+        
         # buttons row
-        grid.addWidget(self.btn_prev,  2, 0, 1, 2)
-        grid.addWidget(self.btn_next,  2, 2, 1, 2)
-        grid.addWidget(self.btn_revise, 2, 4, 1, 2)
-        grid.addWidget(self.btn_png,   2, 6, 1, 1)
-        grid.addWidget(self.btn_reset,  2, 7, 1, 1)
-        grid.addWidget(self.btn_savec, 2, 8)
+        grid.addWidget(self.btn_prev,    2, 0, 1, 2)
+        grid.addWidget(self.btn_next,    2, 2, 1, 2)
+        grid.addWidget(self.btn_revise,  2, 4, 1, 2)
+        grid.addWidget(self.btn_png,     2, 6, 1, 1)
+        grid.addWidget(self.btn_reset,   2, 7, 1, 1)
+        grid.addWidget(self.btn_savec,   2, 8, 1, 1)
+        
+        # --- NEW: Loop controls ---
+        self.loop_btn = QtWidgets.QPushButton('Loop')
+        self.loop_btn.setCheckable(True)
+        
+        self.spn_loop_sec = QtWidgets.QDoubleSpinBox()
+        self.spn_loop_sec.setRange(0.1, 60.0)
+        self.spn_loop_sec.setSingleStep(0.1)
+        self.spn_loop_sec.setValue(0.8)
+        self.spn_loop_sec.setSuffix(" s")
+        self.spn_loop_sec.setFixedWidth(80)
 
-        # empty gap between buttons and slider cluster
-        grid.setColumnStretch(9, 1)
+        # --- NEW: Jump-to index ---
+        self.txt_jump = QtWidgets.QLineEdit()
+        self.txt_jump.setPlaceholderText("Input PC Index and Press Enter")
+        self.txt_jump.setFixedWidth(158)
 
-        # slider cluster, right-justified
-        grid.addWidget(self.lbl_ps,     2, 10, 1, 1, alignment=QtCore.Qt.AlignRight)
-        grid.addWidget(self.sld_ps,     2, 11, 1, 1, alignment=QtCore.Qt.AlignRight)
-        grid.addWidget(self.lbl_ps_val, 2, 12, 1, 1, alignment=QtCore.Qt.AlignLeft)
-        grid.addWidget(self.lbl_alpha,     2, 13, 1, 1, alignment=QtCore.Qt.AlignRight)
-        grid.addWidget(self.sld_alpha,     2, 14, 1, 1, alignment=QtCore.Qt.AlignRight)
-        grid.addWidget(self.lbl_alpha_val, 2, 15, 1, 1, alignment=QtCore.Qt.AlignLeft)
+        # ---- NEW: loop + jump (LEFT of sliders) ----
+        grid.addWidget(self.loop_btn,     2, 9, 1, 1)
+        grid.addWidget(self.spn_loop_sec, 2,10, 1, 1)
+        grid.addWidget(self.txt_jump,     2,11, 1, 2)
+
+        # spacer before slider cluster
+        grid.setColumnStretch(13, 1)
+
+        # ---- slider cluster (RIGHT, unchanged behavior) ----
+        grid.addWidget(self.lbl_ps,       2,14, 1, 1, alignment=QtCore.Qt.AlignRight)
+        grid.addWidget(self.sld_ps,       2,15, 1, 1, alignment=QtCore.Qt.AlignRight)
+        grid.addWidget(self.lbl_ps_val,   2,16, 1, 1, alignment=QtCore.Qt.AlignLeft)
+
+        grid.addWidget(self.lbl_alpha,    2,17, 1, 1, alignment=QtCore.Qt.AlignRight)
+        grid.addWidget(self.sld_alpha,    2,18, 1, 1, alignment=QtCore.Qt.AlignRight)
+        grid.addWidget(self.lbl_alpha_val,2,19, 1, 1, alignment=QtCore.Qt.AlignLeft)
 
         self.status=self.statusBar()
         self.pbar = _make_pbar( max(self.total, 1), initial=1, desc="Scenes", leave=False, ncols=65, 
@@ -948,6 +974,10 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.chk_resume.toggled.connect(self._on_resume_toggle)
         self.sld_ps.valueChanged.connect(self.on_slider)
         self.sld_alpha.valueChanged.connect(self.on_alpha_slider)
+        self.loop_btn.toggled.connect(self._on_loop_toggle)
+        self.spn_loop_sec.valueChanged.connect(self._on_loop_interval_change)
+        self.txt_jump.returnPressed.connect(self._on_jump_to_index)
+
 
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self.save_png)        
 
@@ -1357,6 +1387,36 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.canvas.plotterL.render()
         self.canvas.plotterR.render()
 
+    # ---------- LOOP PLAYBACK ----------
+    def _on_loop_toggle(self, checked: bool):
+        if checked and self.total > 0:
+            interval_ms = int(self.spn_loop_sec.value() * 1000)
+            self.loop_timer.start(interval_ms)
+        else:
+            self.loop_timer.stop()
+
+    def _on_loop_interval_change(self, val: float):
+        if self.chk_loop.isChecked():
+            self.loop_timer.start(int(val * 1000))
+
+    # ---------- JUMP TO INDEX ----------
+    def _on_jump_to_index(self):
+        if self.total == 0:
+            return
+        try:
+            idx = int(self.txt_jump.text().strip()) - 1
+        except ValueError:
+            return
+
+        idx = max(0, min(idx, self.total - 1))
+        self.save_comment()
+        self.idx = idx
+        self._remember_position()
+        self.update_scene()
+
+        self.txt_jump.clear()
+        self.setFocus(QtCore.Qt.OtherFocusReason)
+
     # ——— overlay toggle ————————————————————————————————————————
     def toggle_overlay(self, checked: bool):
         self.overlay_mode = bool(checked)
@@ -1399,6 +1459,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 self.canvas.cleanup()
         except Exception:
             pass
+        self.loop_timer.stop()
         super().closeEvent(event)
 
     def save_comment(self):

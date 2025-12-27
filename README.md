@@ -18,6 +18,8 @@ Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load yo
 - Progress indicator and “Revise” workflow (move files to revision folders)
 - Natural filename sorting; continues where you left off across sessions
 - Composite screenshot export (PNG) of both canvases
+- Loop button to loop through the point cloud with delay timer
+- Jump to text box with input point cloud index
 
 ---
 
@@ -107,6 +109,8 @@ python .\python\app.py
 - Toggle “Toggle Annotations (A)” to show/hide red points when overlaying.
 - Add comments and click “Save Comment”, or export to Excel at any time.
 - Press Ctrl+S to save a side‑by‑side PNG snapshot.
+- Loop through point clouds using the loop button
+- Jump to point cloud using **Input PC Index and Press Enter** text box
 
 ---
 
