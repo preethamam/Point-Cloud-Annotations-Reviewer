@@ -20,6 +20,7 @@ Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load yo
 - Composite screenshot export (PNG) of both canvases
 - Loop button to loop through the point cloud with delay timer
 - Jump to text box with input point cloud index
+- Left navigation pane with thumbnails for a quick view
 
 ---
 
@@ -142,6 +143,7 @@ Notes:
 - Mouse wheel zoom is anchored at the cursor (AutoCAD‑style): hold Ctrl for coarse, Shift for fine steps.
 - Point Size slider updates instantly on both canvases.
 - Reset View returns to top‑down orthographic fit.
+- Left navigation pane with thumbnails for a quick view
 
 ---
 
@@ -163,6 +165,7 @@ Notes:
 - Ctrl+E: SE Isometric view
 - Ctrl+I: NW Isometric view
 - Ctrl+O: NE Isometric view
+- N: Toggle navigation
 
 All toggles work outside text inputs with plain keypress, or anywhere with Shift+key.
 

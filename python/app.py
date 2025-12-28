@@ -4,22 +4,28 @@
 # overlay toggle (red-on-blue vs as-is), compact right-justified slider, 1/N counter,
 # shared 3-D camera (rotate/pan/zoom) for left & right canvases, Save PNG (composite).
 
-import os, re, glob, sys, time, json, shutil
-from typing import Dict, List, Tuple, Optional
+import glob
+import hashlib
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import time
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-
-from PyQt5 import QtCore, QtGui, QtWidgets
 import open3d as o3d
-from tqdm import tqdm
-import pandas as pd            # pip install pandas openpyxl
-from PIL import Image          # pip install pillow
-
+import pandas as pd  # pip install pandas openpyxl
 # ==== NEW: fast GPU renderer (pyvista) ==========================================
 import pyvista as pv
-from pyvistaqt import QtInteractor
 import vtk
-import logging
+from PIL import Image  # pip install pillow
+from PyQt5 import QtCore, QtGui, QtWidgets
+from pyvistaqt import QtInteractor
+from tqdm import tqdm
 
 # Silence VTK global warning/error spam (wglMakeCurrent etc.)
 vtk.vtkObject.GlobalWarningDisplayOff()
@@ -40,17 +46,105 @@ COMMENT_BOX_HEIGHT     = 40            # tweak comment box height here
 SLIDER_WIDTH_PX        = 180           # compact slider width (pixels)
 MARKER_SCALE           = 1.0           # Marker size = slider_value * this factor
 ISO_ELEV               = 35.264        # CAD magic angle (≈ arcsin(1/√3) for true isometric)
+THUMB_SIZE_PX = 96
+THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
+NAV_W = 130
+NAV_NAME_MAX = 30   # adjust to taste
+
+NAV_VISITED_BG = "#f0f4f8"     # subtle gray-blue
+NAV_REVISED_BG = "#ffe6cc"     # soft orange
+NAV_REVISED_FG = "#a84300"
+
 # ==============================================================================
 
 LOCALAPP = os.getenv("LOCALAPPDATA") or str(Path.home() / "AppData/Local")
 APP_DIR  = os.path.join(LOCALAPP, APP_NAME)
 SETTINGS = os.path.join(APP_DIR, "settings.json")
 COMMENTS = os.path.join(APP_DIR, "comments.json")
+THUMB_DIR = os.path.join(APP_DIR, "thumbs")
 
 stem      = lambda p: os.path.splitext(os.path.basename(p))[0]
 file_stem = lambda p: os.path.basename(p)
 natural_k = lambda s: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 ensure_dir= lambda p: os.makedirs(p, exist_ok=True)
+
+def _thumb_path_for(pc_path: str) -> str:
+    """
+    Stable cached filename based on absolute path + mtime + size.
+    If file changes, thumb filename changes automatically.
+    """
+    ap = os.path.abspath(pc_path)
+    try:
+        st = os.stat(ap)
+        sig = f"{ap}|{st.st_mtime_ns}|{st.st_size}"
+    except Exception:
+        sig = ap
+    h = hashlib.md5(sig.encode("utf-8")).hexdigest()
+    ensure_dir(THUMB_DIR)
+    return os.path.join(THUMB_DIR, f"{h}.png")
+
+
+def _make_thumb_png_from_pc(pc_path: str, out_png: str, size_px: int = THUMB_SIZE_PX) -> bool:
+    """
+    Fast top-view thumbnail:
+    - projects points to XY plane
+    - uses Z as a simple z-buffer (highest Z wins) so the visible surface looks right
+    - writes a small RGB image to out_png
+    """
+    try:
+        pc = load_pc(pc_path)
+        if pc is None or len(pc.points) == 0:
+            return False
+
+        xyz, rgb = pc_to_xyz_rgb(pc)
+
+        if xyz is None or len(xyz) == 0:
+            return False
+
+        # cap for speed
+        if len(xyz) > THUMB_MAX_PTS:
+            idx = np.random.choice(len(xyz), THUMB_MAX_PTS, replace=False)
+            xyz = xyz[idx]
+            rgb = rgb[idx]
+
+        # ensure rgb in 0..1
+        if rgb is None or len(rgb) != len(xyz):
+            rgb = np.ones((len(xyz), 3), dtype=np.float32)
+        rgb = np.asarray(rgb, dtype=np.float32)
+        if np.nanmax(rgb) > 1.0:
+            rgb = np.clip(rgb / 255.0, 0.0, 1.0)
+
+        x = xyz[:, 0].astype(np.float64)
+        y = xyz[:, 1].astype(np.float64)
+        z = xyz[:, 2].astype(np.float64)
+
+        xmin, xmax = float(np.min(x)), float(np.max(x))
+        ymin, ymax = float(np.min(y)), float(np.max(y))
+
+        dx = max(xmax - xmin, 1e-12)
+        dy = max(ymax - ymin, 1e-12)
+
+        # map XY to pixel grid
+        W = H = int(size_px)
+        ix = np.clip(((x - xmin) / dx * (W - 1)).astype(np.int32), 0, W - 1)
+        iy = np.clip(((y - ymin) / dy * (H - 1)).astype(np.int32), 0, H - 1)
+
+        # create white background
+        img = np.full((H, W, 3), 255, dtype=np.uint8)
+
+        # simple z-buffer: draw low->high so high Z overwrites (top surface)
+        order = np.argsort(z)
+        ix = ix[order]
+        iy = iy[order]
+        col = (rgb[order] * 255.0).astype(np.uint8)
+
+        # draw (note: image row is y; we flip vertically so it "looks right")
+        img[(H - 1 - iy), ix] = col
+
+        Image.fromarray(img).save(out_png)
+        return True
+    except Exception:
+        return False
 
 def load_settings() -> dict:
     ensure_dir(APP_DIR)
@@ -725,7 +819,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.last_export = settings.get("last_export_path", str(Path.home()))
 
         self.comments: Dict[str,str] = ensure_comments()
-        self.stems, self.anno_map, self.orig_map = self.collect()    
+        self.stems, self.anno_map, self.orig_map = self.collect()            
         
         # --- one-time migration from legacy stem-only keys (only when unambiguous) ---
         def _migrate_legacy_comments():
@@ -783,8 +877,83 @@ class ReviewerApp(QtWidgets.QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QtGui.QIcon(icon_path))
 
-        central=QtWidgets.QWidget(self); self.setCentralWidget(central)
-        v=QtWidgets.QVBoxLayout(central); v.setContentsMargins(6,6,6,6); v.setSpacing(6)
+        central=QtWidgets.QWidget(self); 
+        self.setCentralWidget(central)
+        
+        # ---------- ROOT SPLITTER ----------
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        central.setLayout(QtWidgets.QHBoxLayout())
+        central.layout().setContentsMargins(0, 0, 0, 0)
+        central.layout().addWidget(splitter)
+
+        # ---------- LEFT NAV SEARCH ----------
+        self.nav_search = QtWidgets.QLineEdit()
+        self.nav_search.setPlaceholderText("Search / filter (name, index, comment)")
+        self.nav_search.setClearButtonEnabled(True)
+        self.nav_search.setFixedHeight(24)
+        self.nav_search.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.nav_search.textChanged.connect(self._filter_nav_items)
+
+        # ---------- LEFT NAVIGATION ----------
+        self.list_nav = QtWidgets.QListWidget()
+        self.list_nav.setMinimumWidth(90)
+        self.list_nav.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.list_nav.setVerticalScrollMode(QtWidgets.QAbstractItemView.ScrollPerPixel)
+        self.list_nav.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        
+        self.list_nav.setIconSize(QtCore.QSize(THUMB_SIZE_PX, THUMB_SIZE_PX))
+        self.list_nav.setUniformItemSizes(True)
+        self.list_nav.setSpacing(2)
+        
+        self.list_nav.setStyleSheet("""
+            QListWidget::item:selected {
+                background: #0078d7;
+                color: white;
+            }
+            """)
+        
+        self.list_nav.setViewMode(QtWidgets.QListView.IconMode)
+        self.list_nav.setResizeMode(QtWidgets.QListView.Adjust)
+        self.list_nav.setMovement(QtWidgets.QListView.Static)
+        self.list_nav.setWrapping(True)                 # vertical list
+        self.list_nav.setSpacing(6)
+        
+        # ---------- RIGHT MAIN CONTENT ----------
+        main_widget = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(main_widget)
+        v.setContentsMargins(6, 6, 6, 6)
+        v.setSpacing(6)
+        
+        # LEFT first
+        nav_container = QtWidgets.QWidget()
+        self._nav_visible = True
+        self._nav_last_width = NAV_W
+        nav_container.setMinimumWidth(0)
+        nav_container.setMaximumWidth(1000)   # or NAV_W * 2
+
+        nav_v = QtWidgets.QVBoxLayout(nav_container)
+        nav_v.setContentsMargins(4, 4, 4, 4)
+        nav_v.setSpacing(4)
+
+        nav_v.addWidget(self.nav_search)
+        nav_v.addWidget(self.list_nav, 1)
+
+        splitter.addWidget(nav_container)
+
+        # RIGHT second
+        splitter.addWidget(main_widget)
+        
+        # FIX left pane width
+        splitter.setSizes([NAV_W, 10000])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+
+        # optional: lock resizing
+        splitter.setChildrenCollapsible(True)
+        # splitter.handle(1).setEnabled(False)   # uncomment to hard-lock
+        
+        self._populate_nav()
+        self.list_nav.setCurrentRow(self.idx)
 
         # --- NEW: View mode combo (Top / Bottom / Isometric) ---
         self.view_combo = QtWidgets.QComboBox()
@@ -804,6 +973,14 @@ class ReviewerApp(QtWidgets.QMainWindow):
     
         # top bar
         top=QtWidgets.QHBoxLayout()
+        
+        self.btn_toggle_nav = QtWidgets.QToolButton()
+        self.btn_toggle_nav.setText("☰")   # hamburger
+        self.btn_toggle_nav.setToolTip("Toggle navigation (N)")
+        self.btn_toggle_nav.setCheckable(True)
+        self.btn_toggle_nav.setChecked(True)
+        self.btn_toggle_nav.clicked.connect(self.toggle_nav)
+        
         self.btn_folders   = QtWidgets.QPushButton("Folders")
         self.chk_overlay   = QtWidgets.QCheckBox("Overlay on Original PC (O)")
         self.chk_overlay.setChecked(self.overlay_mode)
@@ -830,6 +1007,8 @@ class ReviewerApp(QtWidgets.QMainWindow):
         top.addWidget(self.btn_export_xl)
         v.addLayout(top)
 
+        top.insertWidget(0, self.btn_toggle_nav)
+        
         # canvases (PyVista)
         self.canvas = DualCanvasPyVista(self)
         v.addWidget(self.canvas, 1)
@@ -910,6 +1089,11 @@ class ReviewerApp(QtWidgets.QMainWindow):
         sc_neiso = QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+O"), self)
         sc_neiso.setContext(QtCore.Qt.ApplicationShortcut)
         sc_neiso.activated.connect(lambda: self.view_combo.setCurrentIndex(9))
+        
+        sc_nav = QtWidgets.QShortcut(QtGui.QKeySequence("N"), self)
+        sc_nav.setContext(QtCore.Qt.ApplicationShortcut)
+        sc_nav.activated.connect(self.toggle_nav)
+
 
         # comment rows — span ALL 20 columns
         grid.addWidget(self.lbl_comment, 0, 0, 1, 20)
@@ -977,6 +1161,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.loop_btn.toggled.connect(self._on_loop_toggle)
         self.spn_loop_sec.valueChanged.connect(self._on_loop_interval_change)
         self.txt_jump.returnPressed.connect(self._on_jump_to_index)
+        self.list_nav.currentRowChanged.connect(self._on_nav_clicked)
 
 
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self.save_png)        
@@ -987,6 +1172,12 @@ class ReviewerApp(QtWidgets.QMainWindow):
             self.update_scene(first=True)
             
         QtWidgets.QApplication.instance().installEventFilter(self)
+        
+        QtCore.QTimer.singleShot(
+            0,
+            lambda: self.canvas.plotterL.interactor.setFocus(QtCore.Qt.OtherFocusReason)
+        )
+
 
     # ----- data collection -----
     def collect(self) -> Tuple[List[str], Dict[str, str], Dict[str, Optional[str]]]:
@@ -1030,6 +1221,206 @@ class ReviewerApp(QtWidgets.QMainWindow):
         stems = sorted(anno_map.keys(), key=natural_k)
         return stems, anno_map, orig_map
 
+    def toggle_nav(self):
+        splitter = self.centralWidget().layout().itemAt(0).widget()
+
+        if self._nav_visible:
+            # ---- collapse ----
+            self._nav_last_width = max(splitter.sizes()[0], 1)
+            splitter.setSizes([0, 1])   # left collapsed, right fills
+            self._nav_visible = False
+            self.btn_toggle_nav.setChecked(False)
+        else:
+            # ---- expand ----
+            w = self._nav_last_width or NAV_W
+            splitter.setSizes([w, 10000])
+            self._nav_visible = True
+            self.btn_toggle_nav.setChecked(True)
+
+    def _filter_nav_items(self, text: str):
+        """
+        Filter LEFT navigation items by:
+        - index (e.g. '12')
+        - filename
+        - comment text
+        """
+        text = text.strip().lower()
+
+        for row in range(self.list_nav.count()):
+            item = self.list_nav.item(row)
+            key  = self.stems[row]
+            anno = self.anno_map.get(key, "")
+
+            # index match
+            idx_str = f"{row+1:04d}"
+
+            # filename match
+            fname = os.path.basename(anno).lower() if anno else key.lower()
+
+            # comment match (absolute-path key first)
+            abs_key = os.path.abspath(anno) if anno else ""
+            cmt = (
+                self.comments.get(abs_key) or
+                self.comments.get(key, "") or
+                ""
+            ).lower()
+
+            visible = (
+                not text or
+                text in idx_str or
+                text in fname or
+                text in cmt
+            )
+
+            item.setHidden(not visible)
+            
+        # ensure current item is visible
+        if 0 <= self.idx < self.list_nav.count():
+            cur_item = self.list_nav.item(self.idx)
+            if cur_item and not cur_item.isHidden():
+                self.list_nav.scrollToItem(cur_item)
+
+
+    def _populate_nav(self):
+        self.list_nav.blockSignals(True)
+        self.list_nav.clear()
+
+        ph = self._placeholder_icon()
+
+        for i, key in enumerate(self.stems):
+            anno = self.anno_map.get(key, "")
+            full_name = os.path.basename(anno) if anno else key
+
+            # ---- truncate for DISPLAY ONLY (left nav) ----
+            if len(full_name) > NAV_NAME_MAX:
+                short_name = full_name[:NAV_NAME_MAX - 1] + "…"
+            else:
+                short_name = full_name
+
+            item = QtWidgets.QListWidgetItem()
+            item.setIcon(ph)
+            item.setText(f"{i+1:04d}\n{short_name}")
+            item.setTextAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+
+            # ---- FULL NAME on hover (left nav only) ----
+            item.setToolTip(full_name)
+
+            self.list_nav.addItem(item)
+
+        self.list_nav.blockSignals(False)
+
+        self._enqueue_thumbs()
+        self._refresh_nav_styles()
+
+    def _update_nav_item_style(self, row: int):
+        """
+        Apply visited / revised styling to a single nav item.
+        """
+        item = self.list_nav.item(row)
+        if item is None:
+            return
+
+        key = self.stems[row]
+        anno_p = self.anno_map.get(key)
+        anno_abs = os.path.abspath(anno_p) if anno_p else ""
+
+        is_current = (row == self.idx)
+        is_visited = key in self._seen
+        is_revised = anno_abs in self.settings.get("REVISED_FILES", [])
+
+        # Current selection: let Qt stylesheet handle it
+        if is_current:
+            item.setBackground(QtGui.QBrush())
+            item.setForeground(QtGui.QBrush())
+            return
+
+        # Revised has highest priority
+        if is_revised:
+            item.setBackground(QtGui.QColor(NAV_REVISED_BG))
+            item.setForeground(QtGui.QColor(NAV_REVISED_FG))
+            item.setToolTip("REVISED — moved to revise folder")
+            return
+
+        # Visited (but not revised)
+        if is_visited:
+            item.setBackground(QtGui.QColor(NAV_VISITED_BG))
+            item.setForeground(QtGui.QColor("#555555"))
+            return
+
+        # Default (unvisited)
+        item.setBackground(QtGui.QBrush())
+        item.setForeground(QtGui.QBrush())
+
+    def _refresh_nav_styles(self):
+        for row in range(self.list_nav.count()):
+            self._update_nav_item_style(row)
+        
+    def _placeholder_icon(self) -> QtGui.QIcon:
+        pm = QtGui.QPixmap(THUMB_SIZE_PX, THUMB_SIZE_PX)
+        pm.fill(QtGui.QColor(240, 240, 240))
+        return QtGui.QIcon(pm)
+
+
+    def _enqueue_thumbs(self):
+        """
+        Build a queue of (row, orig_path, thumb_png) to generate incrementally.
+        """
+        self._thumb_queue = []
+        for row, key in enumerate(self.stems):
+            orig_p = self.orig_map.get(key)
+
+            # fallback: if orig_map missing, try stem-based find (your legacy helper)
+            if not orig_p:
+                anno_p = self.anno_map.get(key)
+                stem_only = os.path.splitext(os.path.basename(anno_p or ""))[0]
+                orig_p = find_file(stem_only, self.ORIG_DIRS)
+
+            if not orig_p or not os.path.exists(orig_p):
+                continue
+
+            out_png = _thumb_path_for(orig_p)
+            self._thumb_queue.append((row, orig_p, out_png))
+
+        # kick off incremental worker
+        if not hasattr(self, "_thumb_timer"):
+            self._thumb_timer = QtCore.QTimer(self)
+            self._thumb_timer.setSingleShot(True)
+            self._thumb_timer.timeout.connect(self._process_one_thumb)
+
+        self._thumb_timer.start(1)
+
+
+    def _process_one_thumb(self):
+        """
+        Generate exactly ONE thumbnail per tick, then reschedule.
+        This keeps UI responsive even with thousands of point clouds.
+        """
+        if not getattr(self, "_thumb_queue", None):
+            return
+
+        row, orig_p, out_png = self._thumb_queue.pop(0)
+
+        # generate if missing
+        if not os.path.exists(out_png):
+            _make_thumb_png_from_pc(orig_p, out_png, size_px=THUMB_SIZE_PX)
+
+        # set icon if still valid row
+        it = self.list_nav.item(row)
+        if it is not None and os.path.exists(out_png):
+            it.setIcon(QtGui.QIcon(out_png))
+
+        # reschedule next
+        if self._thumb_queue:
+            self._thumb_timer.start(1)
+
+
+    def _on_nav_clicked(self, row):
+        if row < 0 or row >= self.total:
+            return
+        self.save_comment()
+        self.idx = row
+        self._remember_position()
+        self.update_scene()
 
     def toggle_annotations(self, checked: bool):
         self.show_annotations = bool(checked)
@@ -1110,10 +1501,6 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE)
 
         self.setWindowTitle(f"{APP_NAME} — {file_name}   ({self.idx+1}/{self.total})")
-
-        # self.txt_comment.blockSignals(True)
-        # self.txt_comment.setPlainText(self.comments.get(key, ""))
-        # self.txt_comment.blockSignals(False)
         
         self.txt_comment.blockSignals(True)
         self.txt_comment.setPlainText(
@@ -1133,6 +1520,12 @@ class ReviewerApp(QtWidgets.QMainWindow):
         # fit according to CURRENT view mode
         self.apply_view(fit=True)
         
+        self.list_nav.blockSignals(True)
+        self.list_nav.setCurrentRow(self.idx)
+        self.list_nav.blockSignals(False)
+        
+        self._refresh_nav_styles()
+
         # at the end of update_scene()
         self.canvas.set_titles(
             "Original",
@@ -1545,6 +1938,8 @@ class ReviewerApp(QtWidgets.QMainWindow):
             pass
 
         save_settings(self.settings)
+        self._refresh_nav_styles()
+
         # =================== END OF INSERTED BLOCK ========================
     
         del self.anno_map[name]
@@ -1689,6 +2084,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 self.ORIG_DIRS=vals["ORIG_DIRS"]; self.ANNO_DIRS=vals["ANNO_DIRS"]; self.REVISE_DIRS=vals["REVISE_DIRS"]
                 self.settings.update(vals); save_settings(self.settings)
                 self.stems, self.anno_map, self.orig_map = self.collect()
+                self._populate_nav()
+                self.list_nav.setCurrentRow(self.idx)
+
                 if not self.stems:
                     QtWidgets.QMessageBox.warning(self, "No files",
                         "No annotation *.ply / *.pcd found in the selected folders. Please select again.")
