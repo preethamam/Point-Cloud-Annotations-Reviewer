@@ -53,7 +53,7 @@ THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
 NAV_W = 135         # adjust to taste
 NAV_NAME_MAX = 30   # adjust to taste
 
-NAV_VISITED_BG = "#f0f4f8"     # subtle gray-blue
+NAV_VISITED_BG = "#d0e7ff"     # light blue
 NAV_REVISED_BG = "#ffe6cc"     # soft orange
 NAV_REVISED_FG = "#a84300"
 
@@ -862,9 +862,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
       
         self.idx=0; self.total=len(self.stems)
         self._seen: set = set()
-        if self.total > 0:
-            # mark the first item as already visited
-            self._seen.add(self.stems[self.idx])
+
         self.point_size = 5.0    # slider shows this
         
         # --- NEW: loop playback state ---
@@ -1642,6 +1640,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.list_nav.setCurrentRow(self.idx)
         self.list_nav.blockSignals(False)
         
+        # update nav styles
         self._refresh_nav_styles()
 
         # at the end of update_scene()
@@ -1956,8 +1955,13 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
     # ----- nav & actions
     def shift(self, d: int):
-        if self.total==0: return
-        self.save_comment()  # autosave on nav
+        if self.total == 0:
+            return
+
+        # ✅ mark the item we are LEAVING as visited
+        self._seen.add(self.stems[self.idx])
+
+        self.save_comment()
         self.idx = (self.idx + d) % self.total
         self._remember_position()
         self.update_scene()
