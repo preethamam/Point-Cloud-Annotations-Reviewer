@@ -26,6 +26,8 @@ from PIL import Image  # pip install pillow
 from PyQt5 import QtCore, QtGui, QtWidgets
 from pyvistaqt import QtInteractor
 from tqdm import tqdm
+import threading
+from joblib import Parallel, delayed
 
 # Silence VTK global warning/error spam (wglMakeCurrent etc.)
 vtk.vtkObject.GlobalWarningDisplayOff()
@@ -48,7 +50,7 @@ MARKER_SCALE           = 1.0           # Marker size = slider_value * this facto
 ISO_ELEV               = 35.264        # CAD magic angle (≈ arcsin(1/√3) for true isometric)
 THUMB_SIZE_PX = 96
 THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
-NAV_W = 130
+NAV_W = 135         # adjust to taste
 NAV_NAME_MAX = 30   # adjust to taste
 
 NAV_VISITED_BG = "#f0f4f8"     # subtle gray-blue
@@ -211,7 +213,17 @@ def _safe_print(*a, **k):
         print(*a, **k)
     except Exception:
         pass
-    
+
+class _ThumbWorker(QtCore.QRunnable):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def run(self):
+        try:
+            self.fn()
+        except Exception:
+            pass    
 # --- add near imports (after tqdm import is fine) ---
 class _DummyTQDM:
     def __init__(self, total=1, initial=0, **kw):
@@ -810,6 +822,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
         # Clean out any non-existent paths
         self.settings["REVISED_FILES"] = [p for p in self.settings["REVISED_FILES"] if os.path.exists(p)]
+        self.settings["thumbs_enabled"] = True
+        self._thumbs_generating = False
+        self._thumb_sweep_timer = None
         save_settings(self.settings)
 
         self.ORIG_DIRS   = settings.get("ORIG_DIRS", [])
@@ -873,9 +888,8 @@ class ReviewerApp(QtWidgets.QMainWindow):
         # UI setup
         self.setWindowTitle(APP_NAME)
         self.resize(TARGET_W_PX, TARGET_H_PX+220)
-        icon_path = os.path.join(os.getcwd(), "icon.png")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QtGui.QIcon(icon_path))
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+        self.setWindowIcon(QtGui.QIcon(icon_path))
 
         central=QtWidgets.QWidget(self); 
         self.setCentralWidget(central)
@@ -891,7 +905,10 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.nav_search.setPlaceholderText("Search / filter (name, index, comment)")
         self.nav_search.setClearButtonEnabled(True)
         self.nav_search.setFixedHeight(24)
-        self.nav_search.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.nav_search.setFocusPolicy(QtCore.Qt.ClickFocus)
+        self.nav_search.setClearButtonEnabled(True)
+        
+
         self.nav_search.textChanged.connect(self._filter_nav_items)
 
         # ---------- LEFT NAVIGATION ----------
@@ -902,7 +919,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.list_nav.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         
         self.list_nav.setIconSize(QtCore.QSize(THUMB_SIZE_PX, THUMB_SIZE_PX))
-        self.list_nav.setUniformItemSizes(True)
+        self.list_nav.setUniformItemSizes(False)
         self.list_nav.setSpacing(2)
         
         self.list_nav.setStyleSheet("""
@@ -973,7 +990,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
     
         # top bar
         top=QtWidgets.QHBoxLayout()
-        
+        self.setTabOrder(self.nav_search, self.list_nav)
         self.btn_toggle_nav = QtWidgets.QToolButton()
         self.btn_toggle_nav.setText("☰")   # hamburger
         self.btn_toggle_nav.setToolTip("Toggle navigation (N)")
@@ -995,6 +1012,10 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.chk_resume.setChecked(bool(self.settings.get("continue_where_left", True)))
 
         self.btn_export_xl = QtWidgets.QPushButton("Export Excel")
+        
+        self.btn_del_thumbs = QtWidgets.QPushButton("Delete Thumbnails")
+        self.btn_del_thumbs.setToolTip("Delete all cached thumbnails")
+
         top.addWidget(self.btn_folders)
         top.addWidget(self.view_combo)
         top.addStretch(1)
@@ -1005,8 +1026,10 @@ class ReviewerApp(QtWidgets.QMainWindow):
         top.addWidget(self.chk_resume)
         top.addSpacing(10)
         top.addWidget(self.btn_export_xl)
+        top.addSpacing(2)
+        top.addWidget(self.btn_del_thumbs)
         v.addLayout(top)
-
+        
         top.insertWidget(0, self.btn_toggle_nav)
         
         # canvases (PyVista)
@@ -1162,7 +1185,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.spn_loop_sec.valueChanged.connect(self._on_loop_interval_change)
         self.txt_jump.returnPressed.connect(self._on_jump_to_index)
         self.list_nav.currentRowChanged.connect(self._on_nav_clicked)
-
+        self.btn_del_thumbs.clicked.connect(self.delete_thumbnails)
 
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+S"), self, activated=self.save_png)        
 
@@ -1220,6 +1243,22 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
         stems = sorted(anno_map.keys(), key=natural_k)
         return stems, anno_map, orig_map
+
+    def delete_thumbnails(self):
+        try:
+            if os.path.isdir(THUMB_DIR):
+                shutil.rmtree(THUMB_DIR)
+
+            self.settings["thumbs_enabled"] = False
+            save_settings(self.settings)
+
+            for i in range(self.list_nav.count()):
+                self.list_nav.item(i).setIcon(self._placeholder_icon())
+
+            self.status.showMessage("Thumbnails deleted (will regenerate on restart)", 4000)
+
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "Delete Thumbnails Failed", str(e))
 
     def toggle_nav(self):
         splitter = self.centralWidget().layout().itemAt(0).widget()
@@ -1300,7 +1339,12 @@ class ReviewerApp(QtWidgets.QMainWindow):
             item = QtWidgets.QListWidgetItem()
             item.setIcon(ph)
             item.setText(f"{i+1:04d}\n{short_name}")
-            item.setTextAlignment(QtCore.Qt.AlignHCenter | QtCore.Qt.AlignTop)
+
+            # --- FORCE CENTERED ICON ABOVE TEXT ---
+            item.setTextAlignment(QtCore.Qt.AlignHCenter)
+            item.setSizeHint(QtCore.QSize(THUMB_SIZE_PX + 12, THUMB_SIZE_PX + 40))
+            item.setToolTip(full_name)
+
 
             # ---- FULL NAME on hover (left nav only) ----
             item.setToolTip(full_name)
@@ -1360,17 +1404,37 @@ class ReviewerApp(QtWidgets.QMainWindow):
         pm.fill(QtGui.QColor(240, 240, 240))
         return QtGui.QIcon(pm)
 
+    def _generate_thumbs_background(self, jobs):
+        try:
+            Parallel(
+                n_jobs=-1,
+                backend="loky",
+                verbose=0
+            )(
+                delayed(_make_thumb_png_from_pc)(p, out)
+                for p, out in jobs
+            )
+        finally:
+            # mark generation complete
+            self._thumbs_generating = False
 
     def _enqueue_thumbs(self):
         """
-        Build a queue of (row, orig_path, thumb_png) to generate incrementally.
+        Start background thumbnail generation (if needed) and
+        start a UI sweeper that keeps updating icons until done.
         """
-        self._thumb_queue = []
+        # If user deleted thumbs and wants them disabled until restart
+        if not self.settings.get("thumbs_enabled", True):
+            return
+
+        jobs = []
+        self._thumb_out_by_row = {}
+
         for row, key in enumerate(self.stems):
             orig_p = self.orig_map.get(key)
 
-            # fallback: if orig_map missing, try stem-based find (your legacy helper)
-            if not orig_p:
+            # keep your legacy fallback if you want (recommended)
+            if not orig_p or not os.path.exists(orig_p):
                 anno_p = self.anno_map.get(key)
                 stem_only = os.path.splitext(os.path.basename(anno_p or ""))[0]
                 orig_p = find_file(stem_only, self.ORIG_DIRS)
@@ -1379,40 +1443,94 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 continue
 
             out_png = _thumb_path_for(orig_p)
-            self._thumb_queue.append((row, orig_p, out_png))
+            self._thumb_out_by_row[row] = out_png
 
-        # kick off incremental worker
-        if not hasattr(self, "_thumb_timer"):
-            self._thumb_timer = QtCore.QTimer(self)
-            self._thumb_timer.setSingleShot(True)
-            self._thumb_timer.timeout.connect(self._process_one_thumb)
+            if not os.path.exists(out_png):
+                jobs.append((orig_p, out_png))
 
-        self._thumb_timer.start(1)
+        # --- background generation (THREADS; reliable in GUI apps) ---
+        if jobs and not self._thumbs_generating:
+            self._thumbs_generating = True
+
+            def worker(j=jobs):
+                try:
+                    Parallel(
+                        n_jobs=-1,
+                        backend="threading",   # IMPORTANT: GUI-safe
+                        verbose=0
+                    )(
+                        delayed(_make_thumb_png_from_pc)(p, out)
+                        for p, out in j
+                    )
+                finally:
+                    self._thumbs_generating = False
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        # --- UI sweeper: keeps trying until everything is shown ---
+        if self._thumb_sweep_timer is None:
+            self._thumb_sweep_timer = QtCore.QTimer(self)
+            self._thumb_sweep_timer.timeout.connect(self._sweep_thumb_icons)
+
+        self._thumb_sweep_timer.start(120)  # smooth, light polling
 
 
-    def _process_one_thumb(self):
-        """
-        Generate exactly ONE thumbnail per tick, then reschedule.
-        This keeps UI responsive even with thousands of point clouds.
-        """
-        if not getattr(self, "_thumb_queue", None):
+    def _sweep_thumb_icons(self):
+        if not hasattr(self, "_thumb_out_by_row"):
             return
 
-        row, orig_p, out_png = self._thumb_queue.pop(0)
+        rows = list(self._thumb_out_by_row.keys())
+        if not rows:
+            self._thumb_sweep_timer.stop()
+            return
 
-        # generate if missing
-        if not os.path.exists(out_png):
-            _make_thumb_png_from_pc(orig_p, out_png, size_px=THUMB_SIZE_PX)
+        batch = 80
+        updated_any = False
 
-        # set icon if still valid row
-        it = self.list_nav.item(row)
-        if it is not None and os.path.exists(out_png):
-            it.setIcon(QtGui.QIcon(out_png))
+        for _ in range(batch):
+            if not rows:
+                break
 
-        # reschedule next
+            r = rows[0]
+            out_png = self._thumb_out_by_row.get(r)
+
+            if out_png and os.path.exists(out_png):
+                it = self.list_nav.item(r)
+                if it is not None:
+                    it.setIcon(QtGui.QIcon(out_png))
+                    updated_any = True
+
+                # 🔥 REMOVE processed row
+                self._thumb_out_by_row.pop(r, None)
+                rows.pop(0)
+            else:
+                # rotate row to the end
+                rows.append(rows.pop(0))
+
+        if not self._thumb_out_by_row:
+            self._thumb_sweep_timer.stop()
+
+        if updated_any:
+            self.list_nav.viewport().update()
+
+    def _process_one_thumb(self):
+        if not getattr(self, "_thumb_queue", None):
+            self._thumb_queue = []
+
         if self._thumb_queue:
-            self._thumb_timer.start(1)
+            row, out_png = self._thumb_queue.pop(0)
 
+            if os.path.exists(out_png):
+                it = self.list_nav.item(row)
+                if it is not None:
+                    it.setIcon(QtGui.QIcon(out_png))
+            else:
+                # not ready → retry later
+                self._thumb_queue.append((row, out_png))
+
+        # 🔴 KEEP POLLING while background generation is active
+        if self._thumb_queue or self._thumbs_generating:
+            self._thumb_timer.start(50)
 
     def _on_nav_clicked(self, row):
         if row < 0 or row >= self.total:
@@ -2108,6 +2226,30 @@ class ReviewerApp(QtWidgets.QMainWindow):
         
     
     def eventFilter(self, obj, ev):        
+        
+        # --- Allow arrow navigation even when search box is focused ---
+        if ev.type() == QtCore.QEvent.KeyPress and ev.key() in (
+            QtCore.Qt.Key_Left,
+            QtCore.Qt.Key_Right,
+            QtCore.Qt.Key_Up,
+            QtCore.Qt.Key_Down,
+        ):
+            fw = QtWidgets.QApplication.focusWidget()
+
+            if fw is self.nav_search:
+                if ev.key() in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Up):
+                    self.shift(-1)
+                else:
+                    self.shift(1)
+                return True
+            
+        # ESC clears search and returns focus to canvas
+        if ev.type() == QtCore.QEvent.KeyPress and ev.key() == QtCore.Qt.Key_Escape:
+            if QtWidgets.QApplication.focusWidget() is self.nav_search:
+                self.nav_search.clear()
+                self.canvas.plotterL.interactor.setFocus(QtCore.Qt.OtherFocusReason)
+                return True
+
         # --- NEW: 'O' / 'o' toggles the "Overlay on Original PC" checkbox ---
         if ev.type() == QtCore.QEvent.KeyPress and ev.key() == QtCore.Qt.Key_O:
             fw = QtWidgets.QApplication.focusWidget()

@@ -21,6 +21,7 @@ Dual‑view, GPU‑accelerated reviewer for 3D point clouds (PLY / PCD). Load yo
 - Loop button to loop through the point cloud with delay timer
 - Jump to text box with input point cloud index
 - Left navigation pane with thumbnails for a quick view
+- Delete Thumbnails button to clear thumbnail cache
 
 ---
 
