@@ -50,7 +50,7 @@ MARKER_SCALE           = 1.0           # Marker size = slider_value * this facto
 ISO_ELEV               = 35.264        # CAD magic angle (≈ arcsin(1/√3) for true isometric)
 THUMB_SIZE_PX = 96
 THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
-NAV_W = 135         # adjust to taste
+NAV_W = 148         # adjust to taste
 NAV_NAME_MAX = 30   # adjust to taste
 
 NAV_VISITED_BG = "#d0e7ff"     # light blue
@@ -411,6 +411,8 @@ class DualCanvasPyVista(QtWidgets.QWidget):
 
         self._pt_size = 5.0
         self.overlay_alpha = 1.0
+        
+        self._scene_updating = False
 
     # ------------------------------------------------------------------
     # Helpers
@@ -474,6 +476,8 @@ class DualCanvasPyVista(QtWidgets.QWidget):
                 render_points_as_spheres=True,
                 lighting=False,
                 show_scalar_bar=False,
+                reset_camera=False,   # ✅ prevents the “go out of bounds then back”
+                render=False,         # ✅ prevents intermediate renders
             )
             setattr(self, attr_actor, actor)
         else:
@@ -490,9 +494,6 @@ class DualCanvasPyVista(QtWidgets.QWidget):
             prop = actor.GetProperty()
             prop.SetOpacity(1.0)
 
-        # ensure fresh render (but don't spam)
-        plotter.render()
-
     # ------------------------------------------------------------------
     # API used by ReviewerApp
     # ------------------------------------------------------------------
@@ -503,10 +504,15 @@ class DualCanvasPyVista(QtWidgets.QWidget):
     def clear(self):
         for pl in (self.plotterL, self.plotterR):
             try:
-                pl.clear()  # keeps camera, just removes actors
+                # Remove actors WITHOUT triggering render
+                for actor in list(pl.renderer.actors.values()):
+                    pl.remove_actor(actor, reset_camera=False, render=False)
             except Exception:
                 pass
-        self.actor_left = self.actor_right_base = self.actor_right_overlay = None
+
+        self.actor_left = None
+        self.actor_right_base = None
+        self.actor_right_overlay = None
 
     def set_left(self, xyz: np.ndarray, rgb: np.ndarray, size: float):
         self._xyzL, self._rgbL = xyz, rgb
@@ -606,7 +612,7 @@ class DualCanvasPyVista(QtWidgets.QWidget):
         cam = plotter.camera
         span_xy = max(dx, dy, 1e-6)  # avoid zero
         # parallel_scale is roughly half the visible height in world units
-        cam.parallel_scale = 0.5 * span_xy * 1.05  # small margin
+        cam.parallel_scale = 0.5 * span_xy * 1.1  # small margin
 
         plotter.reset_camera_clipping_range()
 
@@ -625,9 +631,6 @@ class DualCanvasPyVista(QtWidgets.QWidget):
         # Set camera on left and copy to right
         self._fit_bounds_top_for(all_xyz, self.plotterL)
         self.plotterR.camera_position = self.plotterL.camera_position
-
-        self.plotterL.render()
-        self.plotterR.render()
 
 
     def reset_view(self):
@@ -809,6 +812,22 @@ class DualCanvasPyVista(QtWidgets.QWidget):
                 return True
 
         return super().eventFilter(obj, event)
+    
+    def begin_scene_update(self):
+        self._scene_updating = True
+        for pl in (self.plotterL, self.plotterR):
+            try:
+                pl.interactor.Disable()
+            except Exception:
+                pass
+
+    def end_scene_update(self):
+        self._scene_updating = False
+        for pl in (self.plotterL, self.plotterR):
+            try:
+                pl.interactor.Enable()
+            except Exception:
+                pass
 
 # ---------------- Main window -------------------
 class ReviewerApp(QtWidgets.QMainWindow):
@@ -1552,102 +1571,109 @@ class ReviewerApp(QtWidgets.QMainWindow):
     # ----- plotting helpers (PyVista)
     def update_scene(self, *, first=False):
         if self.total==0: return
-        self.canvas.clear()
+        self.canvas.begin_scene_update()
+        try:
+            self.canvas.clear()
 
-        name = self.stems[self.idx]                     # key is relative path (no ext)
-        anno_p = self.anno_map.get(name)
-        # derive stem-only for compatibility (used for title & old comments)
-        stem_only = os.path.splitext(os.path.basename(anno_p or ""))[0]
-        orig_p = self.orig_map.get(name) or find_file(stem_only, self.ORIG_DIRS)
+            name = self.stems[self.idx]                     # key is relative path (no ext)
+            anno_p = self.anno_map.get(name)
+            # derive stem-only for compatibility (used for title & old comments)
+            stem_only = os.path.splitext(os.path.basename(anno_p or ""))[0]
+            orig_p = self.orig_map.get(name) or find_file(stem_only, self.ORIG_DIRS)
 
-        file_name = file_stem(anno_p or orig_p or name)  # for window title/status
-        key = name  # comments key (new, collision-proof)
-        abs_key = os.path.abspath(anno_p) if anno_p else None
+            file_name = file_stem(anno_p or orig_p or name)  # for window title/status
+            key = name  # comments key (new, collision-proof)
+            abs_key = os.path.abspath(anno_p) if anno_p else None
 
-        # load point clouds
-        orig = load_pc(orig_p)
-        anno = load_pc(anno_p)
+            # load point clouds
+            orig = load_pc(orig_p)
+            anno = load_pc(anno_p)
 
-        # left: original
-        if orig is not None and len(orig.points)>0:
-            xyzL, cL = pc_to_xyz_rgb(orig)
-            self.canvas.set_left(xyzL, cL, self.point_size*MARKER_SCALE)
-        else:
-            self.canvas.set_left(None, None, self.point_size*MARKER_SCALE)
-
-        # right: overlay vs as-is
-        if self.overlay_mode:
-            # base = original colors
+            # left: original
             if orig is not None and len(orig.points)>0:
-                xyzB, cB = pc_to_xyz_rgb(orig)
-                self.canvas.set_right_base(xyzB, cB, self.point_size*MARKER_SCALE)
+                xyzL, cL = pc_to_xyz_rgb(orig)
+                self.canvas.set_left(xyzL, cL, self.point_size*MARKER_SCALE)
             else:
-                self.canvas.set_right_base(None, None, self.point_size*MARKER_SCALE)
+                self.canvas.set_left(None, None, self.point_size*MARKER_SCALE)
 
-            # overlay = red in annotation
-            if anno is not None and len(anno.points)>0:
-                xyzA, cA = pc_to_xyz_rgb(anno)
-                m = red_mask(cA)
-                if self.show_annotations and np.any(m):
-                    self.canvas.set_right_overlay(xyzA[m], cA[m], self.point_size*MARKER_SCALE)
+            # right: overlay vs as-is
+            if self.overlay_mode:
+                # base = original colors
+                if orig is not None and len(orig.points)>0:
+                    xyzB, cB = pc_to_xyz_rgb(orig)
+                    self.canvas.set_right_base(xyzB, cB, self.point_size*MARKER_SCALE)
+                else:
+                    self.canvas.set_right_base(None, None, self.point_size*MARKER_SCALE)
+
+                # overlay = red in annotation
+                if anno is not None and len(anno.points)>0:
+                    xyzA, cA = pc_to_xyz_rgb(anno)
+                    m = red_mask(cA)
+                    if self.show_annotations and np.any(m):
+                        self.canvas.set_right_overlay(xyzA[m], cA[m], self.point_size*MARKER_SCALE)
+                    else:
+                        self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE)
                 else:
                     self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE)
             else:
-                self.canvas.set_right_overlay(None, None, self.point_size*MARKER_SCALE)
-        else:
-            # annotation as-is (split so red draws on top)
-            if anno is not None and len(anno.points) > 0:
-                xyzR, cR = pc_to_xyz_rgb(anno)
-                m = red_mask(cR)
+                # annotation as-is (split so red draws on top)
+                if anno is not None and len(anno.points) > 0:
+                    xyzR, cR = pc_to_xyz_rgb(anno)
+                    m = red_mask(cR)
 
-                # draw non-red first as base
-                if np.any(~m):
-                    self.canvas.set_right_base(xyzR[~m], cR[~m], self.point_size * MARKER_SCALE)
+                    # draw non-red first as base
+                    if np.any(~m):
+                        self.canvas.set_right_base(xyzR[~m], cR[~m], self.point_size * MARKER_SCALE)
+                    else:
+                        self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE)
+                        
+                    # then draw red on top (depth_test=False inside set_right_overlay)
+                    if self.show_annotations and np.any(m):
+                        self.canvas.set_right_overlay(xyzR[m], cR[m], self.point_size * MARKER_SCALE)
+                    else:
+                        self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE)
+
                 else:
                     self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE)
-                    
-                # then draw red on top (depth_test=False inside set_right_overlay)
-                if self.show_annotations and np.any(m):
-                    self.canvas.set_right_overlay(xyzR[m], cR[m], self.point_size * MARKER_SCALE)
-                else:
                     self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE)
 
-            else:
-                self.canvas.set_right_base(None, None, self.point_size * MARKER_SCALE)
-                self.canvas.set_right_overlay(None, None, self.point_size * MARKER_SCALE)
-
-        self.setWindowTitle(f"{APP_NAME} — {file_name}   ({self.idx+1}/{self.total})")
-        
-        self.txt_comment.blockSignals(True)
-        self.txt_comment.setPlainText(
-            (self.comments.get(abs_key) if abs_key else "") or
-            self.comments.get(key, "")
-        )
-        self.txt_comment.blockSignals(False)
-
-        # advance progress only the first time this stem is viewed
-        curr = self.stems[self.idx]
-        if not first and curr not in self._seen:
-            self.pbar.update(1)
-            self._seen.add(curr)
+            self.setWindowTitle(f"{APP_NAME} — {file_name}   ({self.idx+1}/{self.total})")
             
-        self.status.showMessage(f"Viewing: {file_name}")
-        
-        # fit according to CURRENT view mode
-        self.apply_view(fit=True)
-        
-        self.list_nav.blockSignals(True)
-        self.list_nav.setCurrentRow(self.idx)
-        self.list_nav.blockSignals(False)
-        
-        # update nav styles
-        self._refresh_nav_styles()
+            self.txt_comment.blockSignals(True)
+            self.txt_comment.setPlainText(
+                (self.comments.get(abs_key) if abs_key else "") or
+                self.comments.get(key, "")
+            )
+            self.txt_comment.blockSignals(False)
 
-        # at the end of update_scene()
-        self.canvas.set_titles(
-            "Original",
-            "Annotation (overlay)" if self.overlay_mode else "Annotation"
-        )
+            # advance progress only the first time this stem is viewed
+            curr = self.stems[self.idx]
+            if not first and curr not in self._seen:
+                self.pbar.update(1)
+                self._seen.add(curr)
+                
+            self.status.showMessage(f"Viewing: {file_name}")
+            
+            # fit according to CURRENT view mode
+            self.apply_view(fit=True)
+            
+            self.list_nav.blockSignals(True)
+            self.list_nav.setCurrentRow(self.idx)
+            self.list_nav.blockSignals(False)
+            
+            # update nav styles
+            self._refresh_nav_styles()
+
+            # at the end of update_scene()
+            self.canvas.set_titles(
+                "Original",
+                "Annotation (overlay)" if self.overlay_mode else "Annotation"
+            )
+        finally:
+            self.canvas.end_scene_update()
+            self.canvas.plotterL.render()
+            self.canvas.plotterR.render()
+
 
     def apply_view(self, *, fit=False):
         cam = self.canvas.plotterL.camera
@@ -1664,8 +1690,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
             # render once
             self.canvas.plotterL.reset_camera_clipping_range()
-            self.canvas.plotterL.render()
-            self.canvas.plotterR.render()
+            if not self.canvas._scene_updating:
+                self.canvas.plotterL.render()
+                self.canvas.plotterR.render()
             return
 
         # ---------- BOTTOM ----------
@@ -1687,8 +1714,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
             cam.SetFocalPoint(*fp)
 
             self.canvas.plotterL.reset_camera_clipping_range()
-            self.canvas.plotterL.render()
-            self.canvas.plotterR.render()
+            if not self.canvas._scene_updating:
+                self.canvas.plotterL.render()
+                self.canvas.plotterR.render()
             return        
                 
         # FRONT: camera at +Y looking toward -Y → dop = (0, -1, 0) → az=270°
@@ -1816,8 +1844,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
         cam.OrthogonalizeViewUp()
 
         self.canvas.plotterL.reset_camera_clipping_range()
-        self.canvas.plotterL.render()
-        self.canvas.plotterR.render()
+        if not self.canvas._scene_updating:
+            self.canvas.plotterL.render()
+            self.canvas.plotterR.render()
 
     def _fit_bounds_front(self):
         # looking from +Y toward origin => dop = (0, -1, 0)
@@ -1894,8 +1923,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
         cam.OrthogonalizeViewUp()
 
         self.canvas.plotterL.reset_camera_clipping_range()
-        self.canvas.plotterL.render()
-        self.canvas.plotterR.render()
+        if not self.canvas._scene_updating:
+            self.canvas.plotterL.render()
+            self.canvas.plotterR.render()
 
     # ---------- LOOP PLAYBACK ----------
     def _on_loop_toggle(self, checked: bool):
