@@ -1559,7 +1559,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
 
     def toggle_annotations(self, checked: bool):
         self.show_annotations = bool(checked)
-        self.update_scene()
+        self.update_scene(fit=False)
         
     def _on_resume_toggle(self, checked: bool):
         self.settings["continue_where_left"] = bool(checked)
@@ -1569,7 +1569,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         save_settings(self.settings)
 
     # ----- plotting helpers (PyVista)
-    def update_scene(self, *, first=False):
+    def update_scene(self, *, first=False, fit=True):
         if self.total==0: return
         self.canvas.begin_scene_update()
         try:
@@ -1655,7 +1655,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
             self.status.showMessage(f"Viewing: {file_name}")
             
             # fit according to CURRENT view mode
-            self.apply_view(fit=True)
+            self.apply_view(fit=fit)
             
             self.list_nav.blockSignals(True)
             self.list_nav.setCurrentRow(self.idx)
