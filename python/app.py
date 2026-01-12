@@ -50,7 +50,7 @@ MARKER_SCALE           = 1.0           # Marker size = slider_value * this facto
 ISO_ELEV               = 35.264        # CAD magic angle (≈ arcsin(1/√3) for true isometric)
 THUMB_SIZE_PX = 96
 THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
-NAV_W = 148         # adjust to taste
+NAV_W = 132         # adjust to taste
 NAV_NAME_MAX = 30   # adjust to taste
 
 NAV_VISITED_BG = "#d0e7ff"     # light blue
@@ -1552,6 +1552,9 @@ class ReviewerApp(QtWidgets.QMainWindow):
     def _on_nav_clicked(self, row):
         if row < 0 or row >= self.total:
             return
+        # mark the item we are leaving as visited (matches arrow-key behavior)
+        if 0 <= self.idx < self.total:
+            self._seen.add(self.stems[self.idx])
         self.save_comment()
         self.idx = row
         self._remember_position()
@@ -1705,13 +1708,13 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 # then flip camera to the opposite side of the focal point.
                 self.canvas.fit_to_data_top()
 
-            pos = np.array(cam.GetPosition(), dtype=float)
-            fp  = np.array(cam.GetFocalPoint(), dtype=float)
+                pos = np.array(cam.GetPosition(), dtype=float)
+                fp  = np.array(cam.GetFocalPoint(), dtype=float)
 
-            # flip around focal: pos' = fp - (pos - fp)
-            pos2 = fp - (pos - fp)
-            cam.SetPosition(*pos2)
-            cam.SetFocalPoint(*fp)
+                # flip around focal: pos' = fp - (pos - fp)
+                pos2 = fp - (pos - fp)
+                cam.SetPosition(*pos2)
+                cam.SetFocalPoint(*fp)
 
             self.canvas.plotterL.reset_camera_clipping_range()
             if not self.canvas._scene_updating:
