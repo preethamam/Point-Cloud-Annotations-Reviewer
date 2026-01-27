@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 # Point Cloud Reviewer — PyQt5 + PyVista (fast 3-D, synced dual view)
 # Features: folders dialog (persisted), per-scene comments (LocalAppData), Excel export,
 # overlay toggle (red-on-blue vs as-is), compact right-justified slider, 1/N counter,
@@ -50,8 +50,8 @@ MARKER_SCALE           = 1.0           # Marker size = slider_value * this facto
 ISO_ELEV               = 35.264        # CAD magic angle (≈ arcsin(1/√3) for true isometric)
 THUMB_SIZE_PX = 96
 THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
-NAV_W = 132         # adjust to taste
-NAV_NAME_MAX = 30   # adjust to taste
+NAV_W = 145         # adjust to taste
+NAV_NAME_MAX = 20   # adjust to taste
 
 NAV_VISITED_BG = "#d0e7ff"     # light blue
 NAV_REVISED_BG = "#ffe6cc"     # soft orange
@@ -282,23 +282,41 @@ class FolderPrefsDialog(QtWidgets.QDialog):
                 for view in dlg.findChildren((QtWidgets.QListView, QtWidgets.QTreeView)):
                     view.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
 
+                def index_to_path(model, idx):
+                    if model is None or not idx.isValid():
+                        return None
+                    try:
+                        if hasattr(model, "filePath"):
+                            return model.filePath(idx)
+                        if hasattr(model, "sourceModel") and hasattr(model, "mapToSource"):
+                            sm = model.sourceModel()
+                            if sm is not None and hasattr(sm, "filePath"):
+                                return sm.filePath(model.mapToSource(idx))
+                    except Exception:
+                        pass
+                    name = idx.data()
+                    if name:
+                        return dlg.directory().absoluteFilePath(name)
+                    return None
+
                 paths = []
                 if dlg.exec_():
                     # Try the standard API first
-                    paths = [p for p in dlg.selectedFiles() if p]
+                    current_dir = dlg.directory().absolutePath()
+                    paths = [p for p in dlg.selectedFiles() if p and os.path.isdir(p)]
 
                     # If Qt only returned the "current" dir, pull all explicitly selected dirs
-                    if len(paths) <= 1:
-                        root = dlg.directory()
+                    if (not paths) or (len(paths) == 1 and os.path.normcase(paths[0]) == os.path.normcase(current_dir)):
                         seen = set()
                         for view in dlg.findChildren((QtWidgets.QListView, QtWidgets.QTreeView)):
                             sm = view.selectionModel()
                             if not sm:
                                 continue
+                            model = view.model()
                             for idx in sm.selectedIndexes():
                                 if idx.column() != 0:
                                     continue
-                                p = root.absoluteFilePath(idx.data())
+                                p = index_to_path(model, idx)
                                 if os.path.isdir(p) and p not in seen:
                                     seen.add(p)
                                     paths.append(p)
@@ -1657,8 +1675,13 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 
             self.status.showMessage(f"Viewing: {file_name}")
             
-            # fit according to CURRENT view mode
-            self.apply_view(fit=fit)
+            # fit according to CURRENT view mode (skip when preserving user camera)
+            if fit:
+                self.apply_view(fit=True)
+            else:
+                # keep current camera; just ensure clipping range is valid
+                self.canvas.plotterL.reset_camera_clipping_range()
+                self.canvas.plotterR.reset_camera_clipping_range()
             
             self.list_nav.blockSignals(True)
             self.list_nav.setCurrentRow(self.idx)
@@ -1966,7 +1989,8 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self.settings["overlay_red_on_blue"] = self.overlay_mode
         save_settings(self.settings)
         self.canvas.set_titles("Original", "Annotation (overlay)" if self.overlay_mode else "Annotation")
-        self.update_scene()
+        # preserve current camera/view when just toggling overlay
+        self.update_scene(fit=False)
 
     # ----- slider (instant with PyVista)
     def on_slider(self, val: int):
