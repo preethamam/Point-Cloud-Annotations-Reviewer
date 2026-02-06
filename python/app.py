@@ -52,6 +52,7 @@ THUMB_SIZE_PX = 96
 THUMB_MAX_PTS = 200_000   # cap for thumb generation (fast)
 NAV_W = 145         # adjust to taste
 NAV_NAME_MAX = 20   # adjust to taste
+NAV_FAST_REBUILD_THRESHOLD = 50_000  # use fast nav update when list is huge
 
 NAV_VISITED_BG = "#d0e7ff"     # light blue
 NAV_REVISED_BG = "#ffe6cc"     # soft orange
@@ -1355,6 +1356,20 @@ class ReviewerApp(QtWidgets.QMainWindow):
                 self.list_nav.scrollToItem(cur_item)
 
 
+    def _nav_names_for_key(self, key: str) -> Tuple[str, str]:
+        """
+        Return (short_name, full_name) for nav display/tooltip.
+        """
+        anno = self.anno_map.get(key, "")
+        full_name = os.path.basename(anno) if anno else key
+
+        if len(full_name) > NAV_NAME_MAX:
+            short_name = full_name[:NAV_NAME_MAX - 1] + "…"
+        else:
+            short_name = full_name
+
+        return short_name, full_name
+
     def _populate_nav(self):
         self.list_nav.blockSignals(True)
         self.list_nav.clear()
@@ -1362,14 +1377,7 @@ class ReviewerApp(QtWidgets.QMainWindow):
         ph = self._placeholder_icon()
 
         for i, key in enumerate(self.stems):
-            anno = self.anno_map.get(key, "")
-            full_name = os.path.basename(anno) if anno else key
-
-            # ---- truncate for DISPLAY ONLY (left nav) ----
-            if len(full_name) > NAV_NAME_MAX:
-                short_name = full_name[:NAV_NAME_MAX - 1] + "…"
-            else:
-                short_name = full_name
+            short_name, full_name = self._nav_names_for_key(key)
 
             item = QtWidgets.QListWidgetItem()
             item.setIcon(ph)
@@ -1391,12 +1399,59 @@ class ReviewerApp(QtWidgets.QMainWindow):
         self._enqueue_thumbs()
         self._refresh_nav_styles()
 
+    def _remove_nav_item_fast(self, row: int):
+        """
+        Fast path for huge lists: remove one item and renumber
+        without rebuilding the entire nav list.
+        """
+        if row < 0 or row >= self.list_nav.count():
+            return
+
+        self.list_nav.blockSignals(True)
+        try:
+            item = self.list_nav.takeItem(row)
+            if item is not None:
+                del item
+
+            count = self.list_nav.count()
+            for i in range(row, count):
+                key = self.stems[i]
+                short_name, full_name = self._nav_names_for_key(key)
+                it = self.list_nav.item(i)
+                if it is None:
+                    continue
+                it.setText(f"{i+1:04d}\n{short_name}")
+                it.setToolTip(full_name)
+        finally:
+            self.list_nav.blockSignals(False)
+
+        # Shift thumbnail bookkeeping to match new rows
+        if hasattr(self, "_thumb_out_by_row"):
+            new_map = {}
+            for r, out_png in self._thumb_out_by_row.items():
+                if r == row:
+                    continue
+                new_r = r - 1 if r > row else r
+                new_map[new_r] = out_png
+            self._thumb_out_by_row = new_map
+
+        if getattr(self, "_thumb_queue", None):
+            self._thumb_queue = [
+                (r - 1 if r > row else r, out_png)
+                for r, out_png in self._thumb_queue
+                if r != row
+            ]
+
+        self._refresh_nav_styles()
+
     def _update_nav_item_style(self, row: int):
         """
         Apply visited / revised styling to a single nav item.
         """
         item = self.list_nav.item(row)
         if item is None:
+            return
+        if row < 0 or row >= len(self.stems):
             return
 
         key = self.stems[row]
@@ -2117,10 +2172,12 @@ class ReviewerApp(QtWidgets.QMainWindow):
             pass
 
         save_settings(self.settings)
-        self._refresh_nav_styles()
 
         # =================== END OF INSERTED BLOCK ========================
     
+        prev_total = self.total
+        removed_row = self.idx
+
         del self.anno_map[name]
         self.stems.pop(self.idx)
         self.total=len(self.stems)
@@ -2131,6 +2188,10 @@ class ReviewerApp(QtWidgets.QMainWindow):
             QtWidgets.qApp.quit()
         else:
             self.idx %= self.total
+            if prev_total >= NAV_FAST_REBUILD_THRESHOLD:
+                self._remove_nav_item_fast(removed_row)
+            else:
+                self._populate_nav()
             self.update_scene()
 
     def save_png(self):
